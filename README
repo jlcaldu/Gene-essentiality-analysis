@@ -1,0 +1,3 @@
+Code and data to reproduce every analysis published in Caldu-Primo et al. 2021. In vivo and in vitro essentiality estimations capture contrasting functional constraints. NARGAB.
+
+notebook.Rmd -> R notebook with all the analysis scripts.
