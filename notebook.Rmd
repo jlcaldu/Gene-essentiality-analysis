@@ -1,0 +1,2854 @@
+---
+title: "In vitro and in vivo..."
+author: "Jose Luis Caldu..."
+date: "June 2, 2021"
+output:
+  pdf_document: default
+---
+
+## Libraries
+```{r libraries, include=F}
+require (igraph)
+require (ggplot2)
+require (reshape2)
+require (ggpubr)
+require (gplots)
+library (scales)
+require (Vennerable)
+require (ggsci)
+require (ComplexHeatmap)
+require (circlize)
+require (SANTA)
+require (ExpressionAtlas)
+require(RColorBrewer)
+require(corrplot)
+library(fgsea)
+library(tidyverse)
+library(magrittr)
+library(SuperExactTest)
+```
+## Functions
+```{r FUNCTIONS, include=F}
+# Networks
+#### Get.Giant.Component #############################################
+Get.Giant.Component <- function(net) {
+  require(igraph, quietly = TRUE)
+  Comps <- decompose(net)
+  Sizes <- sapply(Comps, vcount)
+  return(Comps[[which.max(Sizes)]])
+}
+####### Check.Topology.Distributions ##############################################################################
+Check.Topology.Distributions <- function(net) {
+  require(igraph)
+  d.net <- degree(net)
+  dd.net <- degree.distribution(net)
+  d <- 1:max(d.net)-1
+  ind <- (dd.net != 0)
+  a.nn.deg.net <- graph.knn(net,V(net))$knn 
+  
+  d.dd.df <- data.frame(d=log(d[ind]), dd=log(dd.net[ind]))
+  d.ann.df <- data.frame(d=log(d.net), ann=log(a.nn.deg.net))
+  require(ggplot2)
+  p1 <- ggplot(d.dd.df) + geom_point(aes(x=d, y=dd), color=ccols[1]) + xlab("Degree k (log)") + ylab("Frequency P(k) (log)") + theme_minimal()
+  p2 <- ggplot(d.ann.df) + geom_point(aes(x=d, y=ann), color=ccols[1]) + xlab("Degree k (log)") + ylab("Average Neighbor Degree (log)") + theme_minimal()
+  multiplot(p1, p2, cols=2)
+}
+#### Complex.Network.Statistics ######################################################################################
+Complex.Network.Statistics <- function(net) {
+  Net.comp.stats <- c(
+    node.number = vcount(net),
+    link.number = ecount(net),
+    mean.degree = mean(degree(net)),
+    clustering.coef = transitivity(net),
+    mean.shortest.path = average.path.length(net),
+    diameter=diameter(net)
+  )
+  return(Net.comp.stats)
+}
+##### Edge.weight.to.distScore #######################################################################################
+Edge.weight.to.distScore <- function(Eweight) {
+  Scorev <- -log10(Eweight/max(Eweight))
+  Scorev[!is.finite(Scorev)] <- max(Scorev[is.finite(Scorev)])
+  Scorev[Scorev < 0] <- 0
+  return(Scorev)
+}
+####  Graph.Node.Score ###############################################################################################
+Graph.Node.Score <- function(Graph, ScoreVec) {
+  require(igraph)
+  V(Graph)$Score <- as.numeric(ScoreVec[match(V(Graph)$name, names(ScoreVec))])
+  return(Graph)
+}
+##### Test.Module.Size ##################################################################################################
+Test.Module.Size <- function(net, node.set, nrand=10000) {
+  Constrained.subnet <- Get.Giant.Component(induced.subgraph(net, node.set))
+  Sampled.sub.nets <- lapply(1:nrand, function(i) Get.Giant.Component(induced.subgraph(net, sample(V(net)$name, length(node.set)))))
+  obs.size <- vcount(Constrained.subnet)
+  rand.sizes <- sapply(Sampled.sub.nets, vcount)
+  rand.e.sizes <- sapply(Sampled.sub.nets, ecount)
+  p.val <- convert.z.score((obs.size-mean(rand.sizes))/sd(rand.sizes))
+  return(list(constrained.subnet=Constrained.subnet, random.max=Sampled.sub.nets[[which.max(rand.sizes)]], rand.sizes=cbind(rand.sizes,rand.e.sizes), p.val=p.val))
+}
+########## Node.Centralities ########################################################################################
+Node.Centralities <- function(network, directed=F, norm =F){
+  Degree <- degree(network, normalized = norm)
+  Betweenness <- betweenness(network,directed = directed, normalized = norm)
+  Eigen <- eigen_centrality(network, directed = directed)$vector
+  return(data.frame(Degree,Betweenness,Eigen))
+}
+##### Graph.Node.Score ################################################################################################## 
+Graph.Node.Score <- function(Graph, ScoreVec) {
+  require(igraph)
+  V(Graph)$Score <- as.numeric(ScoreVec[match(V(Graph)$name, names(ScoreVec))])
+  return(Graph)
+}
+####### Test.distance ############################################################################################## 
+Test.distance <- function(net, node.set, nrand=10000) {
+  temp <- distances(net, v=node.set, to=node.set)
+  obs.Pds <- sapply(1:nrow(temp), function(i) min(temp[i,][-i]))
+  obs.ds <- mean(obs.Pds)
+  obs.dsm <- mean(temp[lower.tri(temp)])
+
+  e.distances.list <- lapply(1:nrand, function(i) { 
+    rset <- sample(V(net)$name, length(node.set))
+    rtemp <- distances(net, v=rset, to=rset)
+    dsr <- mean(sapply(1:nrow(rtemp), function(i) min(rtemp[i,][-i])))
+    dsmr <- mean(rtemp[lower.tri(rtemp)])
+    return(c(e.dsr=dsr,e.dsmr=dsmr))
+    }
+  )
+  
+  e.distances.mat <- do.call("rbind", e.distances.list)
+  
+  return(list(obs.Pds=obs.Pds, obs.ds=obs.ds, obs.dsm=obs.dsm, e.distances.list=e.distances.mat))
+}
+######### Essentiality.percolation ######################################################################################
+Essentiality.percolation <- function(metric="", net=Network){
+  ## Subset Essentiality dataset to keep only genes present in the interactome
+
+  Essentiality <- Essentiality[(Essentiality$symbol %in% V(Network)$name),]
+
+  score <- Essentiality[!is.na(Essentiality[,metric]),c("symbol",metric)]
+  Ranked.nodes <- score[order(score[,2], decreasing = T),1]
+
+  Remove.perc <- round(vcount(net)*seq(0,1, 0.01))
+  max.rem <- which(Remove.perc>length(Ranked.nodes))[1]-1
+
+  Perturbed.nets <- lapply(2:max.rem, function(i) delete.vertices(net, Ranked.nodes[1:Remove.perc[i]]))
+  Perturbed.Sizes <- sapply(Perturbed.nets, function(i) return(vcount(Get.Giant.Component(i))/vcount(net)))
+  Perturbed.Conect <- sapply(Perturbed.nets, function(i) ecount(Get.Giant.Component(i))/ecount(net))
+  return (list(Perturbed.Sizes=Perturbed.Sizes, Perturbed.Conect=Perturbed.Conect))
+}
+###### Efficiency ############################################################
+Efficiency <- function(net){
+  require(psych)
+  paths <- shortest.paths(net)
+  diag(paths) = NA
+  E <- 1/harmonic.mean(as.vector(paths))
+  return(E)
+}
+
+#SANTA ####
+
+######### Plot.Curves.from.Knet #####################################################################################
+Plot.Curves.from.Knet <- function(KnetOut, mTitle,color=ccols[1], lims=c(-0.15, 0.4),...) {
+  temp.df <- data.frame(k.perm=do.call("c", lapply(1:ncol(KnetOut$K.perm),function(i) KnetOut$K.perm[,i])),
+X=rep(1:nrow(KnetOut$K.perm), ncol(KnetOut$K.perm)),
+run=as.factor(rep(1:ncol(KnetOut$K.perm), each=nrow(KnetOut$K.perm))),
+K.obs=rep(KnetOut$K.obs, ncol(KnetOut$K.perm))
+)
+
+  require(ggplot2)
+  Pi <- ggplot(temp.df) + geom_line(aes(y=k.perm, x=X, group = run), color=alpha("grey", 0.1)) + geom_line(aes(y=K.obs, x=X), color=color, size=1) + theme_minimal() + ylab("K") + ggtitle(mTitle) + scale_x_continuous(name="Distance",...) + scale_y_continuous(limits=lims)
+  return(Pi)
+}
+##### AUK_histogram ##############################################################################################
+AUK_histogram <- function(Knetresult, title="", color=ccols[1]){
+  temp.df <- data.frame(AUKperm=Knetresult$AUK.perm)
+  return(ggplot(temp.df) + geom_histogram(aes(x=AUKperm),binwidth = 0.001, fill=alpha("grey", 0.8)) + geom_vline(xintercept = Knetresult$AUK.obs, color=color, size=1) + scale_x_continuous(name = "AUK") + theme_minimal()+ggtitle (title))
+}
+###### Essentiality.Knet.categorical #########################################################################################
+Essentiality.Knet.categorical <- function(group, net = Network){
+  BinaryScores <- as.numeric(V(net)$name%in%group)
+  names(BinaryScores) <- V(net)$name
+  
+  scored.graph <- Graph.Node.Score(net, BinaryScores)
+  categorical.Knet.out <- Knet(scored.graph, nperm=1000, dist.method="shortest.paths", vertex.attr="Score")
+  return (categorical.Knet.out)
+}
+
+# Extra ####
+
+######## convert.z.score ############################################################################################
+convert.z.score <- function(z, one.sided=NULL) {
+  if(is.null(one.sided)) {
+    pval = pnorm(-abs(z));
+    pval = 2 * pval
+  } else if(one.sided=="-") {
+    pval = pnorm(z);
+  } else {
+    pval = pnorm(-z);                                                                                 
+  }
+  return(pval);
+} 
+#### Pvals.to.score #############################################
+Pvals.to.Score <- function(Pvalsv) {
+  Scorev <- -log10(Pvalsv)
+  Scorev[!is.finite(Scorev)] <- max(Scorev[is.finite(Scorev)])
+  Scorev[Scorev < 0] <- 0
+  return(Scorev)
+}
+#####  multiplot #################################################################################################
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  require(grid)
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+#### repeat_matrix #########################################################################################
+repeat_matrix <- function(sets){
+  all <- unique(Reduce(c, sets))
+  mat <- matrix(nrow=length(all),ncol = length(sets),0)
+  rownames(mat) <- all
+  colnames(mat) <- names(sets)
+  which <- lapply(sets, function(i) match(i,rownames(mat)))
+  for(i in 1:length(which)) {mat[which[[i]], i] <- 1 }
+  return(mat)
+}
+###########################################################################################
+# Gene expression enrichment analysis ####
+GenerateEnrichmentScore<-function(data, groups, Datatype="RNAseq"){
+  require(limma)
+    results <- matrix(NA, nrow=dim(data)[1], ncol=length(unique(groups)))
+    rownames(results)<-rownames(data)
+    colnames(results)<-unique(groups)
+    for (groupX in unique(groups)){
+      colX <- RunOneGroupForScore(data, groups, groupX, Datatype="RNAseq")
+      results[,groupX]<-colX
+      cat("Group", groupX, "done\n")
+    }
+    results
+  }
+  RunOneGroupForScore<-function(data,groups, groupX, Datatype="RNAseq"){
+  f<-factor(groups, levels=unique(groups))
+  design<-model.matrix(~0+f)
+  colnames(design)<-unique(groups)
+  mycontrasts<-makeContrasts(contrasts= makeGroupContrastsForOne(groupX,groups), levels=design)
+  if(Datatype=="RNAseq") {
+    v <- voom(data, design)
+    fit<-lmFit(v, design)
+  }
+  if(Datatype=="Array") fit<-lmFit(data, design)
+  
+  fit2<-eBayes(contrasts.fit(fit, mycontrasts))
+  fit.test <- p.adjust(fit2$p.value, method="bonferroni")
+  select <- fit.test > 0.05
+  fit.coef <- fit2$coef
+  fit.coef[select] <- 0
+  apply(fit.coef, 1, sum)
+}
+#internal function to generate contrasts for limma
+makeGroupContrastsForOne<-function(groupX, groups){
+  unique.groups<-unique(groups)
+  results <- rep("", length(unique.groups)-1)
+  counter <- 1
+  for (groupY in unique.groups)
+    if (groupX!=groupY){
+      results[counter]<-paste(groupX,"-", groupY, sep="")
+      counter <- counter+1
+    }
+  results
+}
+#######################
+GetDAVIDTopClusters <- function(daviduser="jlcaldu@ciencias.unam.mx", genes, type="ENSEMBL_GENE_ID", name="x", n.clusts=5){
+  require(RDAVIDWebService)
+  
+  david <- DAVIDWebService(email=daviduser,
+                           url="https://david.ncifcrf.gov/webservice/services/DAVIDWebService.DAVIDWebServiceHttpSoap12Endpoint/")
+
+  result <- addList(david, genes, idType = type, listName=name, listType="Gene")
+  
+  termCluster <- getClusterReport(david, type="Term")
+  
+  return(lapply(1:n.clusts, function(i)  list(Score = termCluster@cluster[[i]]$EnrichmentScore,
+                                              Terms = termCluster@cluster[[i]]$Members$Term)))
+}
+
+
+reduce_enrichmat <- function(enrichmat, exprmat, n.genes=5){
+  ranked_genes <- apply(enrichmat,2, function(i) rownames(enrichmat)[order(i,decreasing=T)] )[1:50,]
+  top_genes <- as.vector(ranked_genes)
+  tmp <- log(exprmat[match(top_genes,rownames(exprmat)),])
+}
+
+top_enriched_heatmap <- function(enrichmat, exprmat, n.genes=5){
+  ranked_genes <- apply(enrichmat,2, function(i) rownames(enrichmat)[order(i,decreasing=T)] )[1:n.genes,]
+  top_genes <- as.vector(ranked_genes)
+  tmp <- log(exprmat[match(top_genes,rownames(exprmat)),])
+  
+  types <- colnames(ranked_genes)
+  x <- factor(colnames(tmp), levels=types)
+  tmp <- tmp[, order(x)]
+  colnames(tmp) <- sort(x)
+  
+  ha <- rowAnnotation(data.frame(a = as.vector(sapply(types, rep,n.genes))),
+                      col = list(a=setNames(pal_lancet()(length(types)), types) ) ,show_legend=F)
+  ha_col <- HeatmapAnnotation (data.frame(a = sort(x)),
+                      col = list(a=setNames(pal_lancet()(length(types)), types) ) ,show_legend=T, show_annotation_name = F,
+                      annotation_legend_param = list(a = list(nrow = 2, title = "", title_position = "leftcenter")))
+  
+  ht = Heatmap(tmp, cluster_rows = F,cluster_columns = F,
+               show_row_dend = F, show_column_names = F, 
+               col = colorRamp2(c(0, round(max(tmp))), c("white", "darkred")), 
+               split = as.vector(sapply(colnames(ranked_genes), rep,n.genes)), name="log(expr)", 
+               top_annotation = ha_col)
+  draw(ha+ht, annotation_legend_side = "bottom")
+}
+##########################
+read_excel_allsheets <- function(filename, tibble = FALSE) {
+    require(readxl)
+    sheets <- readxl::excel_sheets(filename)
+    x <- lapply(sheets, function(X) readxl::read_excel(filename, sheet = X))
+    if(!tibble) x <- lapply(x, as.data.frame)
+    names(x) <- sheets
+    x
+}
+###############################################
+signifStars <- function(pv) {
+  cutpoints = c(0.001, 0.01, 0.05)
+  symbols = c("***", "**", "*")
+  func <- function(x) {
+    ind <- which(x < cutpoints)[1]
+    if( is.na(ind) ) "" else symbols[ind]
+  }
+  sapply(pv, func)
+}
+```
+
+
+## Load Data
+
+```{r Load data, include=F}
+## Interactome
+load("Interactome.RData")
+
+## Essentiality annotations
+load(file="Essentiality.Annotations.RData")
+
+## Functional properties
+load("Annotated.Ensembl.RData")
+##Define working elements
+Network <- UnW.Interactome.graph
+Essentiality.list <- lapply(2:(ncol(Essentiality)-2), function(i) Essentiality[,i])
+names(Essentiality.list) <- colnames(Essentiality)[2:(ncol(Essentiality)-2)]
+for(i in 1:length(Essentiality.list)) names(Essentiality.list[[i]]) <- Essentiality$symbol
+
+Essentiality.list <- lapply(Essentiality.list, function(i) i[!is.na(i)] )
+
+Annotation.df <- as.data.frame(Annotated.Ensembl.gene.annotation.GRCh38.GRanges, row.names = NULL)
+Annotation.df[,10:13] <- lapply(Annotation.df[,10:13], as.numeric)
+
+### OGEE #####
+OGEE_data <- list(devgenes = read.table("OGEE_devgenes.txt", sep='\t', header = T),
+                   early_expr = read.table("OGEE_earliest_expression.txt", sep='\t', header = T),
+                   duplications = read.table("OGEE_dupgenes.txt", sep='\t', header = T) )
+
+OGEE_data <- sapply(OGEE_data, function(i) i[i$sciName=="Homo sapiens",]) ## keep only human data
+OGEE_data <- sapply(OGEE_data, function(i) i[i$locus %in% Annotated.Ensembl.gene.annotation.GRCh38.GRanges$ensembl,]) ## keep only protein coding genes
+OGEE_data$devgenes$symbol <- Annotated.Ensembl.gene.annotation.GRCh38.GRanges$symbol[match(OGEE_data$devgenes$locus, Annotated.Ensembl.gene.annotation.GRCh38.GRanges$ensembl)]
+OGEE_data$early_expr$symbol <- Annotated.Ensembl.gene.annotation.GRCh38.GRanges$symbol[match(OGEE_data$early_expr$locus, Annotated.Ensembl.gene.annotation.GRCh38.GRanges$ensembl)]
+OGEE_data$duplications$symbol <- Annotated.Ensembl.gene.annotation.GRCh38.GRanges$symbol[match(OGEE_data$duplications$locus, Annotated.Ensembl.gene.annotation.GRCh38.GRanges$ensembl)]
+
+#### Conservation index 
+load("Conservation.index.GRanges.RData")
+load("orthologs_matrix.RData")
+
+### Diseases GWAS
+GWAS <- readRDS('GWAS.mapped.genes.rds')
+
+ccols = pal_nejm()(7)
+```
+
+## Results 1: Define in vivo and in vitro groups by mean rank
+
+We define consensus in vivo / in vitro groups by calculating the mean rank of genes among the in vivo (6) and in vitro (10) measures. Tolerant genes are the 20% of genes with lower rank (lower constraint) and Intolerant genes are the top 20% (highest constraint).
+
+```{r Mean rank, echo =FALSE}
+## Make in vivo and in vitro scores rankings
+Essentiality_rank <-list(in_vivo = apply(Essentiality[,2:7],2, rank, na.last="keep"),
+                         in_vitro = apply(Essentiality[,8:17],2, rank, na.last="keep"))
+
+for(i in 1:length(Essentiality_rank)) { rownames(Essentiality_rank[[i]]) <- Essentiality$symbol}
+
+mean_ranks <- sapply(Essentiality_rank, function(i) rowMeans(i, na.rm = T) )
+mean_ranks <- apply(mean_ranks,2,function(i) i[!is.na(i)])
+
+Tolerant.tresh <- sapply(mean_ranks, quantile, .2) ## highest rank = more tolerant
+Intolerant.tresh <- sapply(mean_ranks, quantile, .8) ## lowest rank = less tolerant
+
+### Define in vivo(in vitro) (In)Tolerant groups
+Consensus.groups <- list(
+  Tolerant = lapply (1:length(Tolerant.tresh), function(i) names(mean_ranks[[i]])[mean_ranks[[i]]<=Tolerant.tresh[i]]),
+  Intolerant = lapply (1:length(Intolerant.tresh), function(i) names(mean_ranks[[i]])[mean_ranks[[i]]>=Intolerant.tresh[i]]))
+
+names(Consensus.groups$Tolerant) <- names (mean_ranks)
+names(Consensus.groups$Intolerant) <- names (mean_ranks)
+
+# #### Define subgroups: Consistent : Tolerant
+#                                   Intolerant
+#                      Inconsistent : TvivoIvitro (tolerant in vivo, intolerant in vitro)
+#                                     IvivoTvitro (intolerant in vivo, tolerant in vitro)
+
+subgroups <- list(Consistent =   list (Tolerant = intersect(Consensus.groups$Tolerant$in_vivo, Consensus.groups$Tolerant$in_vitro),
+                                       Intolerant = intersect(Consensus.groups$Intolerant$in_vivo,Consensus.groups$Intolerant$in_vitro)),
+                  Inconsistent = list (TvivoIvitro = intersect(Consensus.groups$Tolerant$in_vivo,Consensus.groups$Intolerant$in_vitro),
+                                       IvivoTvitro = intersect(Consensus.groups$Intolerant$in_vivo,Consensus.groups$Tolerant$in_vitro)) )
+```
+
+
+```{r , echo =FALSE}
+Global.list <- list()
+Global.list$Groups <- Consensus.groups
+Global.list$Subgroups <- subgroups
+Global.list$mean.ranks <- mean_ranks
+```
+#### Figure 2 plots
+
+```{r  echo=F}
+##### a) Correlation plot
+
+groups.corr <- cor(apply(Essentiality[,2:17],2, rank, na.last="keep"), use = "complete.obs")
+
+corrplot(groups.corr, order="hclust",type='lower', method = 'circle', 
+         col=brewer.pal(n=8, name="RdBu"), addrect = 2, 
+         tl.pos = 'l', tl.col = 'black', tl.cex = .7)
+
+##### b) Lines plot 
+
+tmp = data.frame(percent=seq(0,100,1),sapply(mean_ranks, quantile, seq(0,1,.01)) )
+
+ggplot(tmp[tmp$percent>=20&tmp$percent<=80,], aes( x=percent))+
+  geom_line(aes(y=in_vivo, linetype="in vivo"), size =1)+
+  geom_line(aes(y=in_vitro, linetype="in vitro"), size =1)+
+  geom_line(data=tmp[tmp$percent<=20,], aes(y=in_vitro,col="Tolerant", linetype="in vitro"), size=1.5)+
+  geom_line(data=tmp[tmp$percent>=80,], aes(y=in_vitro,col="Intolerant", linetype="in vitro"), size=1.5)+
+  geom_line(data=tmp[tmp$percent<=20,], aes(y=in_vivo,col="Tolerant", linetype="in vivo"), size=1.5)+
+  geom_line(data=tmp[tmp$percent>=80,], aes(y=in_vivo,col="Intolerant", linetype="in vivo"), size=1.5)+
+  scale_linetype_manual(values = c("in vivo"= "solid", "in vitro" = "twodash"))+
+  scale_color_manual(values = c("Tolerant"= ccols[2], "Intolerant" = ccols[1]))+
+  theme_pubr()+geom_vline(xintercept = c(20,80), linetype="dotted")+ coord_flip()+ 
+  scale_x_continuous(breaks=c(0,20,50,80,100)) + ylab("mean rank") + xlab("genes (%)") +
+  theme(legend.pos="")
+
+## c) Venn diagram ####
+groups <- list(Intolerant.invivo= Global.list$Groups$Intolerant$in_vivo,
+               Intolerant.invitro= Global.list$Groups$Intolerant$in_vitro,
+               Tolerant.invivo= Global.list$Groups$Tolerant$in_vivo,
+               Tolerant.invitro= Global.list$Groups$Tolerant$in_vitro)
+plot(Venn(groups), doWeights=T, type="ellipses")  
+```
+
+
+## Result 2: Network properties associated to genes mutational constraint
+
+### Nonrandom modular aggregation
+
+We compare the statistical significance of  tolerant/intolerant modules size and connectivity in the interactome. This is how significantly bigger(smaller)/dense(sparse) is the intolerant(tolerant) module with respect to random expectation.
+
+#### Intolerant/Essential module size
+
+```{r (In)Tolerant nonrandom module size, include=F}
+Consensus.Module.Sizes <- list(Intolerant = lapply(Consensus.groups$Intolerant, function(i) Test.Module.Size (Network, i)),
+                              Tolerant = lapply(Consensus.groups$Tolerant, function(i) Test.Module.Size (Network, i)))
+
+rnd <- (list(size = list(in_vivo = Consensus.Module.Sizes$Intolerant$in_vivo$rand.sizes[,1],
+                         in_vitro = Consensus.Module.Sizes$Intolerant$in_vitro$rand.sizes[,1]),
+
+             connectivity = list(in_vivo = Consensus.Module.Sizes$Intolerant$in_vivo$rand.sizes[,2],
+                                 in_vitro = Consensus.Module.Sizes$Intolerant$in_vitro$rand.sizes[,2])) )
+
+obs <- ( list(size = list(in_vivo = 
+            data.frame(Intolerant = vcount(Consensus.Module.Sizes$Intolerant$in_vivo$constrained.subnet),
+                       Tolerant = vcount(Consensus.Module.Sizes$Tolerant$in_vivo$constrained.subnet) ),
+                          in_vitro = 
+              data.frame(Intolerant = vcount(Consensus.Module.Sizes$Intolerant$in_vitro$constrained.subnet),
+                         Tolerant= vcount(Consensus.Module.Sizes$Tolerant$in_vitro$constrained.subnet))) ,
+            connectivity = list( in_vivo = 
+              data.frame(Intolerant = ecount(Consensus.Module.Sizes$Intolerant$in_vivo$constrained.subnet),
+                         Tolerant = ecount(Consensus.Module.Sizes$Tolerant$in_vivo$constrained.subnet) ),
+                                in_vitro = 
+                data.frame(Intolerant = ecount(Consensus.Module.Sizes$Intolerant$in_vitro$constrained.subnet),
+                           Tolerant= ecount(Consensus.Module.Sizes$Tolerant$in_vitro$constrained.subnet) ) ) ))
+
+Global.list$Figure3$module_Sc_Cc$obs <- obs
+Global.list$Figure3$module_Sc_Cc$rnd <- rnd
+```
+
+```{r module Z score, echo=F}
+module_size_z_scores <- list(
+    Tolerant = list(
+      in_vivo =  (obs$size$in_vivo$Tolerant - mean(rnd$size$in_vivo))/sd(rnd$size$in_vivo),
+      in_vitro = (obs$size$in_vitro$Tolerant - mean(rnd$size$in_vitro))/sd(rnd$size$in_vitro)),
+    Intolerant = list(
+      in_vivo = (obs$size$in_vivo$Intolerant - mean(rnd$size$in_vivo))/sd(rnd$size$in_vivo),
+      in_vitro = (obs$size$in_vitro$Intolerant - mean(rnd$size$in_vitro))/sd(rnd$size$in_vitro)) )
+
+module_connectivity_z_score <- list(
+  Tolerant=list(
+    in_vivo = (obs$connectivity$in_vivo$Tolerant - mean(rnd$connectivity$in_vivo))/sd(rnd$connectivity$in_vivo),
+    in_vitro = (obs$connectivity$in_vitro$Tolerant - mean(rnd$connectivity$in_vitro))/sd(rnd$connectivity$in_vitro)),
+  Intolerant = list(
+    in_vivo = (obs$connectivity$in_vivo$Intolerant - mean(rnd$connectivity$in_vivo))/sd(rnd$connectivity$in_vivo),
+    in_vitro = (obs$connectivity$in_vitro$Intolerant - mean(rnd$connectivity$in_vitro))/sd(rnd$connectivity$in_vitro) ) )
+```
+
+The observed intolerant genes module is significantly larger and more connected than the random expectation for in vivo and in vitro measures. The observed tolerant genes module is significantly smaller than the random expectation for in vivo measures, but it is not significant for in vitro measures. Tolerant modules are significantly less connected for in vivo and in vitro groups.
+
+#### Enrichment of (in)tolerant genes (categorical Knet) 
+
+We next tested whether the tolerant/intolerant sets of genes, show a statistically significant higher clustering in the interactome using the k-net algorithm.
+
+```{r Essentiality scores Knet categorical enrichment, echo=FALSE}
+#### Tolerant Gene sets ##############
+Consensus.Knet.enrichment <- list(Tolerant = lapply (Consensus.groups$Tolerant, Essentiality.Knet.categorical),
+                                 Intolerant = lapply (Consensus.groups$Intolerant, Essentiality.Knet.categorical))
+Global.list$Figure3$SANTA <- Consensus.Knet.enrichment
+```
+
+```{r knet z score, include=F}
+knet.zscore <- list(Tolerant=lapply(Consensus.Knet.enrichment$Tolerant, function(i) (i$AUK.obs-mean(i$AUK.perm))/sd(i$AUK.perm)),
+                  Intolerant=lapply(Consensus.Knet.enrichment$Intolerant,  function(i)
+                    (i$AUK.obs-mean(i$AUK.perm))/sd(i$AUK.perm)))
+```
+
+Intolerant genes are found closer to each other no matter what essentiality measure is used to defined the set; and mutation tolerant genes are more dispersed than would randomly be expected.
+
+
+### Intramodular Distance 
+
+To statistically test this distances distribution, we generate a set of 1000 random subgraphs with the same number of nodes and compare their intramodular distance distribution with the observed one for intolerant and tolerant gene sets.
+
+
+```{r Measure distances, echo=FALSE}
+Consensus.Test.distance <- list (Tolerant = lapply( Consensus.groups$Tolerant, function(i) Test.distance(Network, i)),
+                                Intolerant = lapply( Consensus.groups$Intolerant, function(i) Test.distance(Network, i)) )
+Global.list$Figure3$Distance <- Consensus.Test.distance
+```
+
+```{r distance z score, echo=F}
+min_dist_zscore <- list(
+  Tolerant=lapply(Global.list$Figure3$Distance$Tolerant, function(i) (i$obs.ds-mean(i$e.distances.list[,1]))/sd(i$e.distances.list[,1])),
+  Intolerant=lapply(Global.list$Figure3$Distance$Intolerant, function(i) (i$obs.ds-mean(i$e.distances.list[,1]))/sd(i$e.distances.list[,1])))
+
+mean_dist_zscore <- list(
+  Tolerant=lapply(Global.list$Figure3$Distance$Tolerant, function(i) (i$obs.dsm-mean(i$e.distances.list[,2]))/sd(i$e.distances.list[,2])),
+  Intolerant=lapply(Global.list$Figure3$Distance$Intolerant, function(i) (i$obs.dsm-mean(i$e.distances.list[,2]))/sd(i$e.distances.list[,2])) )
+```
+
+
+### Centrality 
+
+
+#### Network topological description
+
+```{r, eval=F, include=F}
+Interactome.graph.centrality.mat <- 
+  data.frame(degree = igraph::degree(UnW.Interactome.graph),
+             betweenness = betweenness(UnW.Interactome.graph,directed = T),
+             coreness = coreness(Network))
+
+Interactome.graph.centrality.mat$betweenness==
+Network.topological.results.list$Centrality$betweenness
+
+Network.topological.results.list <- list(
+  Network=UnW.Interactome.graph,
+  TopologyDescription = Complex.Network.Statistics(UnW.Interactome.graph), 
+  Centrality= Interactome.graph.centrality.mat)
+```
+
+
+```{r (In)Tolerant sets centrality, inclue=F}
+Global.list$Figure3$Centrality <- Network.topological.results.list$Centrality
+
+Consensus.centrality <- lapply(Global.list$Groups, lapply, function(i)
+    Global.list$Figure3$Centrality[rownames(Global.list$Figure3$Centrality) %in% i,])
+
+### z-scores
+gene.length <- sapply(Global.list$Groups$Tolerant, length)
+
+Random.means <- lapply(lapply(gene.length, function(i)     lapply(1:10000, function(j) 
+  Global.list$Figure3$Centrality [sample(1:nrow(Global.list$Figure3$Centrality), i),])), 
+  function(i) t(sapply(i, colMeans, na.rm=T)))
+
+Obs.means <- lapply(Consensus.centrality, lapply, apply, 2, mean, na.rm=T)
+
+centrality.z.scores <- lapply(c("Tolerant","Intolerant"), function(i)
+  lapply(c("in_vivo", "in_vitro"), function(j) (Obs.means[[i]][[j]]-colMeans(Random.means[[j]]))/apply(Random.means[[j]],2,sd)))
+names(centrality.z.scores) <- c("Tolerant", "Intolerant")
+names(centrality.z.scores$Tolerant) <- c("in_vivo", "in_vitro")
+names(centrality.z.scores$Intolerant) <- c("in_vivo", "in_vitro")
+```
+
+
+### Network properties z scores
+
+``` {r zscores aggregate, echo=F}
+network_z_scores <- list(Tolerant=list(
+  in_vivo=list(module_size = module_size_z_scores$Tolerant$in_vivo,
+               module_connectivity = module_connectivity_z_score$Tolerant$in_vivo,
+               knet = knet.zscore$Tolerant$in_vivo,
+               min_dist = min_dist_zscore$Tolerant$in_vivo,
+               mean_dist = mean_dist_zscore$Tolerant$in_vivo,
+               degree = centrality.z.scores$Tolerant$in_vivo["degree"],
+               betweenness = centrality.z.scores$Tolerant$in_vivo['betweenness'],
+               coreness = centrality.z.scores$Tolerant$in_vivo['coreness']),
+  in_vitro=list(module_size = module_size_z_scores$Tolerant$in_vitro,
+               module_connectivity = module_connectivity_z_score$Tolerant$in_vitro,
+               knet = knet.zscore$Tolerant$in_vitro,
+               min_dist = min_dist_zscore$Tolerant$in_vitro,
+               mean_dist = mean_dist_zscore$Tolerant$in_vitro,
+               degree = centrality.z.scores$Tolerant$in_vitro["degree"],
+               betweenness = centrality.z.scores$Tolerant$in_vitro['betweenness'],
+               coreness = centrality.z.scores$Tolerant$in_vitro['coreness'])),
+  Intolerant=list(
+  in_vivo=list(module_size = module_size_z_scores$Intolerant$in_vivo,
+               module_connectivity = module_connectivity_z_score$Intolerant$in_vivo,
+               knet = knet.zscore$Intolerant$in_vivo,
+               min_dist = min_dist_zscore$Intolerant$in_vivo,
+               mean_dist = mean_dist_zscore$Intolerant$in_vivo,
+               degree = centrality.z.scores$Intolerant$in_vivo["degree"],
+               betweenness = centrality.z.scores$Intolerant$in_vivo['betweenness'],
+               coreness = centrality.z.scores$Intolerant$in_vivo['coreness']),
+  in_vitro=list(module_size = module_size_z_scores$Intolerant$in_vitro,
+               module_connectivity = module_connectivity_z_score$Intolerant$in_vitro,
+               knet = knet.zscore$Intolerant$in_vitro,
+               min_dist = min_dist_zscore$Intolerant$in_vitro,
+               mean_dist = mean_dist_zscore$Intolerant$in_vitro,
+               degree = centrality.z.scores$Intolerant$in_vitro["degree"],
+               betweenness = centrality.z.scores$Intolerant$in_vitro['betweenness'],
+               coreness = centrality.z.scores$Intolerant$in_vitro['coreness'])))
+
+Global.list$Figure3$z_scores <- network_z_scores
+
+```
+
+### Structural robustness
+
+The impact of perturbations of (in)tolerant/(un)constrained gene sets was assessed by removing this genes from the interactome and measuring the following network properties on the remaining network: (i) separation into isolated components, via the size of the giant component; (ii) connectivity loss: via the total number of remaining edges; and (iii) increase of path lengths, by measuring the average path length.
+
+```{r Percolation analysis by mean rank in vivo vs in vitro, echo=F}
+consensus.percolation <- list()
+for (i in c("in_vivo","in_vitro")){
+  Remove.perc <- round(vcount(Network)*seq(0,1, 0.01))
+  order.nodes <- names(Global.list$mean.ranks[[i]])[order(Global.list$mean.ranks[[i]], decreasing = T)] ## order nodes in decreasing mean tolerance
+  max.rem <- which(Remove.perc>length(order.nodes)) [1]-1
+
+  Perturbed.nets <- lapply(2:max.rem, function(i) delete.vertices(Network, order.nodes[1:Remove.perc[i]]))
+  Perturbed.Sizes <- sapply(Perturbed.nets, function(i) return(vcount(Get.Giant.Component(i))/vcount(Network)))
+  Perturbed.Conect <- sapply(Perturbed.nets, function(i) ecount(Get.Giant.Component(i))/ecount(Network))
+  consensus.percolation[[i]] <- data.frame(size=Perturbed.Sizes, connect=Perturbed.Conect)
+  rm(Perturbed.nets)
+}
+```
+
+```{r Random percolation simulation, include=F}
+Remove.perc <- round(vcount(net)*seq(0,1, 0.01))
+
+Rand.Percolation.Simulations <- lapply(1:2, function(j) {
+ Rand.Nodes <- sample(V(net)$name, length(V(net)$name))
+ Rand.Perturbed.nets <- lapply(2:(length(Remove.perc)-1), function(i) delete.vertices(net, Rand.Nodes[1:Remove.perc[i]]))
+ Rand.Perturbed.Sizes <- sapply(Rand.Perturbed.nets, function(i) vcount(Get.Giant.Component(i))/vcount(net))
+ Rand.Perturbed.Conect <- sapply(Rand.Perturbed.nets, function(i) ecount(Get.Giant.Component(i))/ecount(net))
+ return(list(Rand.Perturbed.Sizes=Rand.Perturbed.Sizes, Rand.Perturbed.Conect=Rand.Perturbed.Conect))
+ }
+)
+
+Global.list$Figure4$groups.robustness <- consensus.percolation
+Global.list$Figure4$random.robustness <- Rand.Percolation.Simulations
+```
+
+To evaluate if the observed behavior significantly affected the interactome structure,  we simulated random damage in the interactome by removing the same number of random nodes and measuring the above mentioned properties. This is done to confirm whether the variants carried by normal population occur in the less damaging positions among all the possible locations or not.
+
+```{r Gene set perturbation, echo=FALSE, include=F}
+### Group perturbations ####
+consensus.perturbed.net <- list(
+  Tolerant = data.frame(
+    size= sapply(Consensus.groups$Tolerant, function(i) vcount(Get.Giant.Component(delete.vertices(Network, i)))/vcount(Network)),
+    connect = sapply(Consensus.groups$Tolerant, function(i) ecount(Get.Giant.Component(delete.vertices(Network, i)))/ecount(Network))),
+  Intolerant = data.frame(
+    size= sapply(Consensus.groups$Intolerant, function(i) vcount(Get.Giant.Component(delete.vertices(Network, i)))/vcount(Network)),
+    connect = sapply(Consensus.groups$Intolerant, function(i) ecount(Get.Giant.Component(delete.vertices(Network, i)))/ecount(Network))) )
+
+### Group perturbations random expectation ####
+gene.length <- sapply(Consensus.groups$Tolerant, length)
+
+vnet <- vcount(Network)
+enet <- ecount(Network)
+random.exp <- lapply(gene.length, function(len)
+  apply(t(sapply(1:1000, function(j){
+      net = Get.Giant.Component(delete.vertices(Network, sample(1:vnet,len)))
+      c(size = vcount(net)/vnet, connect = ecount(net)/enet)
+    })), 2, function(i) c(mean=mean(i), sd=sd(i))))
+
+### Group perturbations z score ####
+perc_zscore <- list(
+  perturbed.size=list(
+    Tolerant = list(in_vivo = (consensus.perturbed.net$Tolerant["in_vivo","size"]-random.exp$in_vivo["mean","size"])/random.exp$in_vivo["sd","size"],
+                 in_vitro = (consensus.perturbed.net$Tolerant["in_vitro","size"]-random.exp$in_vitro["mean","size"])/random.exp$in_vitro["sd","size"]),
+    Intolerant = list(in_vivo = (consensus.perturbed.net$Intolerant["in_vivo","size"]-random.exp$in_vivo["mean","size"])/random.exp$in_vivo["sd","size"],
+                 in_vitro = (consensus.perturbed.net$Intolerant["in_vitro","size"]-random.exp$in_vitro["mean","size"])/random.exp$in_vitro["sd","size"])),
+  perturbed.connect=list(
+    Tolerant = list(in_vivo = (consensus.perturbed.net$Tolerant["in_vivo","connect"]-random.exp$in_vivo["mean","connect"])/random.exp$in_vivo["sd","connect"],
+                 in_vitro = (consensus.perturbed.net$Tolerant["in_vitro","connect"]-random.exp$in_vitro["mean","connect"])/random.exp$in_vitro["sd","connect"]),
+    Intolerant = list(in_vivo = (consensus.perturbed.net$Intolerant["in_vivo","connect"]-random.exp$in_vivo["mean","connect"])/random.exp$in_vivo["sd","connect"],
+                 in_vitro = (consensus.perturbed.net$Intolerant["in_vitro","connect"]-random.exp$in_vitro["mean","connect"])/random.exp$in_vitro["sd","connect"])))
+
+Global.list$Figure4$group.perturbation <- consensus.perturbed.net
+Global.list$Figure4$group.random.exp <- random.exp
+Global.list$Figure4$z_score <- perc_zscore
+```
+
+### Figure 3: Network properties
+
+```{r Figure 3 a) Network plot , eval=F}
+## Interactome
+Network <- UnW.Interactome.graph
+
+nodes <- sample(1:vcount(Network), .1*(vcount(Network)))
+toy.net <- Get.Giant.Component(induced.subgraph(Network, nodes))
+
+V(toy.net)$color <- alpha("darkgray",.4)
+V(toy.net)$color[V(toy.net)$name%in%Global.list$Groups$Intolerant$in_vivo] <- alpha(ccols[1],.5)
+V(toy.net)$color[V(toy.net)$name%in%Global.list$Groups$Tolerant$in_vivo ] <- alpha(ccols[2],.5)
+
+V(toy.net)$size <- 4
+V(toy.net)$size[V(toy.net)$name%in%Global.list$Groups$Intolerant$in_vivo] <- 5
+V(toy.net)$size[V(toy.net)$name%in%Global.list$Groups$Tolerant$in_vivo ] <- 5
+
+plot(toy.net, vertex.label="", edge.width=0.4, 
+     edge.arrow.size=0, edge.color=alpha("gray",.5),
+     layout=layout_with_lgl(toy.net,area = 10*(vcount(toy.net)^3)),
+     vertex.frame.color=adjustcolor("black", alpha.f = .2))
+```
+
+
+```{r subnetworks graphs, eval=F}
+## Intolerant subgraph
+i = match(Global.list$Groups$Intolerant$in_vitro, V(Network)$name)
+nodes <-sample(i, .5*(length(i))) 
+int.toy.net <- induced.subgraph(Network, nodes)
+V(int.toy.net)$color <- alpha(ccols[1],.5)
+
+i = match(Global.list$Groups$Tolerant$in_vitro, V(Network)$name)
+nodes <-sample(i, .5*(length(i))) 
+tol.toy.net <- induced.subgraph(Network, nodes)
+V(tol.toy.net)$color <- alpha(ccols[2],.5)
+
+plot(int.toy.net, vertex.label="", edge.width=0.4, vertex.size=5, 
+      edge.arrow.size=0, edge.color=alpha("gray",.5),
+      layout=layout_components,
+      vertex.frame.color=adjustcolor("black", alpha.f = .2))
+plot(tol.toy.net, vertex.label="", edge.width=0.4, vertex.size=5, 
+    edge.arrow.size=0, edge.color=alpha("gray",.5),
+    layout=layout_components,
+    vertex.frame.color=adjustcolor("black", alpha.f = .2))
+```
+
+```{r Fig3 c)}
+
+### c) Z scores ####
+  
+tmp <- melt(Global.list$Figure3$z_scores)
+tmpmat <- data.frame(Intolerant_invivo = tmp[tmp$L1=="Intolerant" & tmp$L2=="in_vivo","value"],
+                  Intolerant_invitro = tmp[tmp$L1=="Intolerant" & tmp$L2=="in_vitro","value"],
+                  Tolerant_invivo = tmp[tmp$L1=="Tolerant" & tmp$L2=="in_vivo","value"],
+                  Tolerant_invitro = tmp[tmp$L1=="Tolerant" & tmp$L2=="in_vitro","value"]) 
+rownames(tmpmat) <- tmp$L3[tmp$L1=="Tolerant" & tmp$L2=="in_vivo"]
+tmppval <- convert.z.score(as.matrix(tmpmat))
+tmpsignif <- symnum(tmppval,corr = F, na=F, cutpoints=c(0,.0001,.001,.05,1), symbols = c("***", "**", "*", "n.s."))
+
+  
+ha <- HeatmapAnnotation(b = rep(c("in vivo", "in vitro"), 2), a = c(rep("Intolerant", 2), rep("Tolerant", 2)),
+                        col = list(a = c("Tolerant"=ccols[2],"Intolerant"=ccols[1]), b = c("in vivo" = ccols[4], "in vitro" = ccols[3])),show_legend = F)
+
+labels=c(expression("S"[c]), expression("C"[c]),expression("AUK"[Knet]),"min D", "mean D", "degree", "betweenness", "coreness")
+
+h1 <- rowAnnotation(labels = anno_text(labels, which = "row"), 
+                    width = unit(.8,"in"))+
+  Heatmap(tmpmat, cluster_rows = F, cluster_columns = F,
+        show_column_names = F, show_row_names = F,
+        bottom_annotation = ha, #bottom_annotation_height = unit(.3,"in"), 
+        cell_fun = function(j, i, x, y, width, height, fill) {
+          grid.text(sprintf("%s", tmpsignif[i, j]), x, y, gp = gpar(fontsize = 18))},
+        heatmap_legend_param = list(title="z score", legend_direction ="horizontal"), 
+        rect_gp = gpar(col = "white", lty = 1, lwd = 3),
+        col = colorRamp2(c(-40,-10, 0,10, 40), c("blue","dodgerblue", "white", "tomato","red"))) 
+
+  draw(h1, heatmap_legend_side = "bottom")
+```
+
+```{r Figure 3 b , echo=F}
+### random size ####################
+Freqs <- seq(0,1, 0.01)[-101]
+rand.perc <- sapply(Global.list$Figure4$random.robustness,function(i) unlist(i[[1]]))
+rand.perc <- rbind(rep(1,ncol(rand.perc)), rand.perc)
+mean.rand.size <- data.frame(Frac=rep(Freqs,1000), mean = rowMeans(rand.perc))
+rand.perc.size <- data.frame(Frac=rep(Freqs,1000), melt(as.data.frame(rand.perc)))
+##### random connectivity ####################
+Freqs <- seq(0,1, 0.01)[-101]
+rand.perc <- sapply(Global.list$Figure4$random.robustness,function(i) unlist(i[[2]]))
+rand.perc <- rbind(rep(1,ncol(rand.perc)), rand.perc)
+mean.rand.conec <- data.frame(Frac=rep(Freqs,1000), mean = rowMeans(rand.perc))
+rand.perc.conec <- data.frame(Frac=rep(Freqs,1000), melt(as.data.frame(rand.perc)))
+
+## Intolerant in vivo size #########
+Global.list$Figure4$groups.robustness$in_vivo$Freqs <- seq(0,1, 0.01)[1:nrow(Global.list$Figure4$groups.robustness$in_vivo)+1]
+
+Global.list$Figure4$groups.robustness$in_vitro$Freqs <- seq(0,1, 0.01)[1:nrow(Global.list$Figure4$groups.robustness$in_vitro)+1]
+
+### a) Size percolation ####
+p1 <- ggplot(data=Global.list$Figure4$groups.robustness$in_vitro, aes(x=Freqs, y=size)) + 
+## Random lines
+  geom_line(data=rand.perc.size, aes(x=Frac, y=value, group=variable), color="gray", alpha=0.01)+ 
+  geom_line(data=mean.rand.size, aes(x=Frac, y=mean), color="black", linetype="dashed")+
+## Intolerant lines
+  geom_line(data=Global.list$Figure4$groups.robustness$in_vitro, alpha= 0.7, aes(color="in vitro"), size=1)+
+  geom_line(data=Global.list$Figure4$groups.robustness$in_vivo, alpha= 0.7, aes(color="in vivo"), size=1)+
+  scale_color_manual(values = c("in vivo"=ccols[4],"in vitro"=ccols[3]))+
+  theme_pubr() + xlab("f") + ylab(expression(paste("S"[f],"/S"[0], sep="")))  + 
+  theme(legend.position = "bottom", legend.title = element_blank(), axis.text = element_text(size=8))+
+  geom_vline(xintercept = 0.2, linetype="dotted")
+
+### Inset_1
+Ins_1 <- ggplot(data=Global.list$Figure4$groups.robustness$in_vitro, aes(x=Freqs, y=size)) +
+## Random lines
+  geom_line(data=rand.perc.size, aes(x=Frac, y=value, group=variable), color="gray", alpha=0.01)+ 
+  geom_line(data=mean.rand.size, aes(x=Frac, y=mean), color="black", linetype="dashed")+
+## Intolerant lines
+  geom_line(data=Global.list$Figure4$groups.robustness$in_vitro, alpha= 0.7, aes(color="in vitro"), size=1)+
+  geom_line(data=Global.list$Figure4$groups.robustness$in_vivo, alpha= 0.7, aes(color="in vivo"), size=1)+
+  scale_color_manual(values = c("in vivo"=ccols[4],"in vitro"=ccols[3]))+
+  theme_pubr() + xlab("") + ylab("")  + 
+  theme(legend.position = "", legend.title = element_blank(), axis.text = element_text(size=8))+
+  geom_vline(xintercept = 0.2, linetype="dotted") + 
+  scale_x_continuous(limits=c(.15,.25))+ scale_y_continuous(limits=c(.69,.85))
+
+### c) Connectivity percolation ####
+p2<- ggplot(Global.list$Figure4$groups.robustness$in_vivo, aes(x=Freqs, y=connect)) + 
+  theme_pubr() + xlab("f") + ylab(expression(paste("C"[f],"/C"[0], sep="")))  + 
+  geom_line(data=rand.perc.size, aes(x=Frac, y=value, group=variable), color="gray", alpha=0.01)+ 
+  geom_line(data=mean.rand.size, aes(x=Frac, y=mean), color="black", linetype="dashed")+
+  geom_line(data=Global.list$Figure4$groups.robustness$in_vitro, alpha= 0.7, aes(color="in vitro"), size=1)+
+  geom_line(data=Global.list$Figure4$groups.robustness$in_vivo, alpha= 0.7, aes(color="in vivo"), size=1)+
+  scale_color_manual(values = c("in vivo"=ccols[4],"in vitro"=ccols[3]))+
+  theme(legend.position = "bottom", legend.title = element_blank(), axis.text = element_text(size=8))+
+  geom_vline(xintercept = 0.2, linetype="dotted")
+## Inset 2
+Ins_2 <- ggplot(Global.list$Figure4$groups.robustness$in_vivo, aes(x=Freqs, y=connect)) + 
+  theme_pubr() + xlab("") + ylab("")  + 
+  geom_line(data=rand.perc.size, aes(x=Frac, y=value, group=variable), color="gray", alpha=0.01)+ 
+  geom_line(data=mean.rand.size, aes(x=Frac, y=mean), color="black", linetype="dashed")+
+  geom_line(data=Global.list$Figure4$groups.robustness$in_vitro, alpha= 0.7, aes(color="in vitro"), size=1)+
+  geom_line(data=Global.list$Figure4$groups.robustness$in_vivo, alpha= 0.7, aes(color="in vivo"), size=1)+
+  scale_color_manual(values = c("in vivo"=ccols[4],"in vitro"=ccols[3]))+
+  theme(legend.position = "", legend.title = element_blank(), axis.text = element_text(size=8))+
+  geom_vline(xintercept = 0.2, linetype="dotted")+
+  scale_x_continuous(limits=c(.15,.25))+ scale_y_continuous(limits=c(.3,.85))
+
+ multiplot(p1, p2, cols = 2)
+ multiplot(Ins_1,Ins_2, cols = 2)
+
+```
+
+## Result 3: Functional molecular properties of tolerant/intolerant gene sets
+
+### Functional properties
+
+We evaluate enrichment among tolerant and intolerant gene sets (compared to 1000 random samples of the same number of genes) for the following molecular properties:
+
+* Haploinsufficiency
+* Intrinsic Disorder 
+* Expression Breadth and Tau (GTEx)
+* Espression rate and peak (GTEx)
+
+For each feature we calculate a z-score comparing the (in)tolerant group mean with the random expectation.
+
+```{r Gene sets functional properties distribution, echo= F}
+Groups.annotations <- list(Tolerant = lapply(Consensus.groups$Tolerant, function(i) Annotation.df[Annotation.df$symbol%in%i,c(10:13,20:30)]),
+                           Intolerant = lapply(Consensus.groups$Intolerant, function(i) Annotation.df[Annotation.df$symbol%in%i, c(10:13,20:30)]))
+
+
+group.sizes <- sapply(Consensus.groups$Tolerant, length)
+
+random.annotation <-list(mean = sapply(group.sizes, function(size)
+  sapply(colnames(Annotation.df)[c(10:13,20:30)], function(feature) mean(
+    sapply(1:10000, function(i) mean(sample(Annotation.df[,feature],size),na.rm=T))) )),
+  sd= sapply(group.sizes, function(size)
+  sapply(colnames(Annotation.df)[c(10:13,20:30)], function(feature) sd(
+    sapply(1:10000, function(i) mean(sample(Annotation.df[,feature],size),na.rm=T)) )) ))
+
+annotation.z.score <- list(Tolerant=(sapply(Groups.annotations$Tolerant,colMeans,na.rm= T) - random.annotation$mean)/random.annotation$sd,
+                           Intolerant=(sapply(Groups.annotations$Intolerant,colMeans,na.rm= T) - random.annotation$mean)/random.annotation$sd)
+
+Global.list$Figure5$groups.annotation <- Groups.annotations
+Global.list$Figure5$annotation <- Annotation.df[,c(10:13,20:30)]
+Global.list$Figure5$z.score <- annotation.z.score
+```
+
+```{r}
+pvals <- convert.z.score(Global.list$Figure5$z.score$Intolerant[c(6,7,8,9),])
+p.adjust(pvals, "fdr")
+```
+
+### Figure 3: Functional molecular properties
+```{r , echo=F}
+### Molecular features distribution ####
+tmp <- melt(list(All = list(All=Global.list$Figure5$annotation), 
+                 Tolerant=Global.list$Figure5$groups.annotation$Tolerant, 
+                 Intolerant = Global.list$Figure5$groups.annotation$Intolerant))
+
+tmp <- tmp[-c(grep("Roadmap",tmp$variable),grep("Age",tmp$variable),grep("GTExExpressionR",tmp$variable),grep("GTExExpressionP",tmp$variable), grep("FANTOM5", tmp$variable)),] #remove some variables
+
+tmp$variable <- factor(tmp$variable, levels= c("Haploinsufficiency.GHIS", "IntrinsicDisorderScore", "GTExExpressionBreadth", "GTExExpressionTau"))
+
+ggviolin(tmp,x="L2", y="value", color="L1",fill="L2", add="boxplot",alpha = .5, size=1, width = 0.75, add.params=list(fill = "white",width=.15), scale="width") +
+  facet_wrap(~variable, scale="free_y", ncol = 2)+
+  xlab("") + ylab("") +  
+  theme(legend.position = "bottom", legend.title = element_blank() ,axis.text = element_text(size=10)) + 
+  scale_color_manual(values = c("All"="gray","Tolerant"=ccols[2],"Intolerant"=ccols[1])) + 
+  scale_fill_manual(values = c("All"= "gray","in_vivo" = ccols[4],"in_vitro" = ccols[3])) +
+  scale_x_discrete(breaks=c("All","in_vitro","in_vivo"), labels = c("All","in vitro","in vivo"))
+```
+
+```{r Figure 3 d), echo=F}
+### d) Z scores barplot ####
+tmpz <- melt(Global.list$Figure5$z.score)
+tmpz <- tmpz[-c(grep("Roadmap",tmpz$Var1),grep("Age",tmpz$Var1),grep("GTExExpressionR",tmpz$Var1),grep("GTExExpressionP",tmpz$Var1), grep("FANTOM5", tmpz$Var1)),] #remove some variables
+
+tmpz$pval <- convert.z.score(tmpz$value)
+tmpz$signif <- symnum(tmpz$pval,corr = F, na=F, cutpoints=c(0,.0001,.001,.05,1), symbols = c("***", "**", "*", "n.s."))
+
+tmpz$Var1 <- factor(tmpz$Var1, levels= c("Haploinsufficiency.GHIS", "IntrinsicDisorderScore"  ,"GTExExpressionBreadth","GTExExpressionTau"))
+tmpz$Var2 <- factor(tmpz$Var2, levels=c("in_vivo","in_vitro"))
+
+ggbarplot(tmpz, x="Var1", y= "value",fill="L1", color="L1",alpha=.6, stat="identity", size=1, facet.by = "Var2") +
+  geom_hline(yintercept = 0,linetype="dashed") + xlab("")+ylab("Z score") + 
+  scale_color_manual(values = c(ccols[1],ccols[2])) +
+  scale_fill_manual(values = c(ccols[1],ccols[2])) +
+  theme(legend.position = "", axis.text.x = element_text(angle = 45, hjust = 1), axis.text=element_text( size=8))+ 
+  geom_text(aes(label=signif),position = position_dodge(), size=6)+
+  scale_x_discrete(breaks=c("GTExExpressionTau","GTExExpressionBreadth", "IntrinsicDisorderScore","Haploinsufficiency.GHIS"), labels=c("Tau","Breadth","Disorder","GHIS"))
+```
+
+### Protein Classes
+
+Proteins are classified in TF, Transporters, Receptors {G-protein coupled receptors, Nuclear receptors}, Enzymes, Peptidase, Kinase, Cancer-related, RNA binding protein (RBP). The classification is taken from The human protein atlas, adding TFs from [Lambert, 2018] and RBAs from
+[Gertsberger,2014], Trasporters and receptors where added from [Southan et al 2014 IUPHAR].
+
+```{r Groups protein class, echo=F}
+protein.class <- read.csv("protein_classes.tsv",sep="\t", header = T, stringsAsFactors = F, fill=T)
+protein.class <- protein.class[protein.class$Gene%in%V(Network)$name,] # subset to keep only genes present in the interactome
+protein.class <- protein.class[!duplicated(protein.class$Gene),] ## remove genes with duplicated name
+protein.class$Unclassified <- 0
+protein.class$Unclassified[rowSums(protein.class[,3:10])==0] <- 1 ## mark unclassified genes
+
+Groups_protein_class <- list(
+  Tolerant = lapply(Global.list$Groups$Tolerant, function(i) protein.class[protein.class$Gene%in%i, 3:11]),
+  Intolerant = lapply(Global.list$Groups$Intolerant, function(i) protein.class[protein.class$Gene%in%i, 3:11]) )
+
+Consensus_class_sum <- list(Tolerant=sapply(Groups_protein_class$Tolerant, colSums),
+                            Intolerant=sapply(Groups_protein_class$Intolerant, colSums))
+
+group.sizes <- sapply(Global.list$Groups$Tolerant, length)
+
+random_classes <- list(
+  in_vivo = t(sapply(1:10000, function(i) colSums(protein.class[sample(1:nrow(protein.class), group.sizes["in_vivo"]), 3:11]))),
+  in_vitro = t(sapply(1:10000, function(i) colSums(protein.class[sample(1:nrow(protein.class), group.sizes["in_vitro"]), 3:11]))))
+
+Global.list$Figure6$Groups_class <- Groups_protein_class
+Global.list$Figure6$random_class <- random_classes
+Global.list$Figure6$Groups_count <- Consensus_class_sum
+Global.list$Figure6$all_count <- colSums(protein.class[,3:11] )
+```
+
+### Figure 5 a): Protein classes
+
+```{r Figure 5 a), echo=F}
+### Protein class distribution barplots ####
+random_means <- sapply(Global.list$Figure6$random_class, function(i) apply(i,2,mean))
+group.sizes <- sapply(Global.list$Groups$Tolerant, length)
+random_means <- sapply(c("in_vivo","in_vitro"), function(i) random_means[,i]/group.sizes[i]*100)
+
+tmp3 <- melt(list(Tolerant= Global.list$Figure6$Groups_count$Tolerant/group.sizes*100,
+                    Intolerant = Global.list$Figure6$Groups_count$Intolerant/group.sizes*100,
+                    Random=random_means))
+
+tmp3$Var2 <- factor(tmp3$Var2, levels=c("in_vivo","in_vitro"))
+tmp3$value[tmp3$value<1] <- 1
+tmp3$L1 <- factor(tmp3$L1, levels=c("Intolerant","Random","Tolerant"))
+
+ tmp3 <- tmp3[!tmp3$L1=="Random",]
+Random = melt(cbind(in_vivo=Global.list$Figure6$all_count[1:9]/sum(Global.list$Figure6$all_count[1:9])*100,
+                 in_vitro=Global.list$Figure6$all_count[1:9]/sum(Global.list$Figure6$all_count[1:9])*100) )
+Random$L1 <- "Random"
+
+  ggplot(tmp3, aes(x=reorder(Var1,value), y=value, color=L1, fill=L1))+
+    geom_bar(stat="identity", width=0.7,position=position_dodge(width=.9), alpha=.7, size=1) +
+    geom_point(data=Random, shape=95, size=18)+
+    facet_grid(Var2~.)+ scale_y_log10(limits=c(1,60), breaks=c(1,3,10,50))+
+    scale_fill_manual(values = c("Random"="gray","Tolerant"=ccols[2],"Intolerant"=ccols[1]))+
+    scale_color_manual(values = c("Random"="black","Tolerant"=ccols[2],"Intolerant"=ccols[1]))+
+    theme_pubr() + theme(legend.position = "",axis.text.x = element_text(size=9, angle = 90, hjust = 1))+
+    xlab("")+ylab("%")
+```
+
+```{r}
+### c) z score ####
+    random_means <- sapply(Global.list$Figure6$random_class, function(i) apply(i,2,mean))
+    random_sd <- sapply(Global.list$Figure6$random_class, function(i) apply(i,2,sd))
+    
+    class_z_score <- list(
+      Tolerant= sapply(c("in_vivo","in_vitro"), 
+                       function(i) (Global.list$Figure6$Groups_count$Tolerant[,i]-random_means[,i])/random_sd[,i]),
+      Intolerant= sapply(c("in_vivo","in_vitro"), 
+                       function(i) (Global.list$Figure6$Groups_count$Intolerant[,i]-random_means[,i])/random_sd[,i]))
+    
+    tmp4 <- melt(class_z_score)
+    tmp4$pval <- convert.z.score(tmp4$value)
+    tmp4$signif <- symnum(tmp4$pval,corr = F, na=F, cutpoints=c(0,.0001,.001,.05,1), symbols = c("***", "**", "*", "n.s."))
+    tmp4$Var2 <- factor(tmp4$Var2, levels=c("in_vitro","in_vivo"))
+    tmp4$Var1 <- factor(tmp4$Var1, levels=c("Unclassified","Enzymes","RBP", "Cancer", "TF", "Transporters","Receptors","Kinase","Peptidase"))
+
+    ggplot(tmp4, aes(x=Var1, y= value)) + 
+      geom_bar(aes(color=L1, fill=L1), alpha=0.8, stat="identity", position = position_dodge(.7),width = 0.7) +
+      geom_hline(yintercept = 0,linetype="dashed") + xlab("")+ylab("Z score") + 
+      facet_grid(Var2~.,scale="free")+
+      scale_y_continuous(breaks = c(-10,-5,0,5,10,20,40))+
+      scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1])) +
+      scale_fill_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1])) +
+      theme_pubr()+geom_vline(xintercept = 1:9, linetype="dotted",color="gray")+
+      theme(legend.position = "", axis.text = element_text(size=8))+ 
+      geom_text(aes(label=signif, group=L1),position = position_dodge(.8), size=5)
+```
+
+
+### DAVID functional cluster enrichment
+
+```{r}
+#### Intolerant genes enrichment DAVID ####
+enriched <- lapply(Global.list$Groups$Intolerant, function(i) Annotated.Ensembl.gene.annotation.GRCh38.GRanges$ensembl[Annotated.Ensembl.gene.annotation.GRCh38.GRanges$symbol%in%i])
+
+DAVID_Intolerant <- lapply(enriched, function(i) GetDAVIDTopClusters(genes =sample(i,3000)) )
+
+## Tolerant
+enriched <- lapply(Global.list$Groups$Tolerant, function(i) Annotated.Ensembl.gene.annotation.GRCh38.GRanges$ensembl[Annotated.Ensembl.gene.annotation.GRCh38.GRanges$symbol%in%i])
+
+DAVID_Tolerant <- lapply(enriched, function(i) GetDAVIDTopClusters(genes =sample(i, 2999)) )
+
+DAVID_functional_clusters <- list(Intolerant=DAVID_Intolerant, Tolerant=DAVID_Tolerant)
+```
+
+
+```{r Figure 5 b}
+##### Figures ####
+## Intolerant
+tmp <- lapply(DAVID_functional_clusters$Intolerant,function(j) t(sapply(j, function(i) cbind(Score=i$Score, Term=i$Term[2]) )) )
+tmp <- lapply(tmp,as.data.frame)
+lng <- melt(tmp)
+lng$V1 <- as.numeric(as.character(lng$V1))
+lng$V2 <- as.factor(make.unique(as.character(lng$V2)))
+lng$L1 <- factor(lng$L1, levels=c("in_vivo", "in_vitro"))
+
+p1 <- ggbarplot(lng, x="V2",y="V1", fill="L1", color="L1",
+          sort.val = "asc", position = position_dodge(), alpha=0.6,
+          facet.by = "L1",  scales="free_y", panel.labs = list(L1 = c("in vivo", "in vitro")),
+          lab.size = 2.5, lab.pos = "out", lab.vjust = 0)+ 
+  theme(legend.position = "", axis.text.y=element_blank(),axis.ticks.y=element_blank(), axis.text.x=element_text(size=8), axis.title = element_text(size=10)) + 
+  scale_fill_manual(values = c("All"="gray","in_vivo"=ccols[4],"in_vitro"=ccols[3]))+
+  scale_color_manual(values = c("All"="gray","in_vivo"=ccols[4],"in_vitro"=ccols[3]))+
+  ylab("Enrichment Score")+xlab("")+coord_flip()+ggtitle("Intolerant")
+
+# Tolerant
+tmp <- lapply(DAVID_functional_clusters$Tolerant,function(j) t(sapply(j, function(i) cbind(Score=i$Score, Term=i$Term[2]) )) )
+tmp <- lapply(tmp,as.data.frame)
+lng <- melt(tmp)
+lng$V1 <- as.numeric(as.character(lng$V1))
+lng$V2 <- as.factor(make.unique(as.character(lng$V2)))
+lng$L1 <- factor(lng$L1, levels=c("in_vivo", "in_vitro"))
+
+p2 <- ggbarplot(lng, x="V2",y="V1", fill="L1", color="L1",
+          sort.val = "asc",position = position_dodge(),alpha=0.6,
+          facet.by = "L1",  scales="free_y", panel.labs = list(L1 = c("in vivo", "in vitro")),
+          lab.size = 2.5, lab.vjust = 0)+
+  theme(legend.position = "", axis.text.y=element_blank(),axis.ticks.y=element_blank(), axis.text.x=element_text(size=8), axis.title = element_text(size=10)) +
+  scale_fill_manual(values = c("All"="gray","in_vivo"=ccols[4],"in_vitro"=ccols[3]))+
+  scale_color_manual(values = c("All"="gray","in_vivo"=ccols[4],"in_vitro"=ccols[3]))+
+  ylab("Enrichment Score")+xlab("")+coord_flip()+ggtitle("Tolerant")
+
+  multiplot(p1, p2, cols = 2)
+```
+
+## Result 4: Evolutionary patterns
+### Conservation index
+
+```{r  Orthologs matrix }
+all.groups <- unique(unlist(sapply(Global.list$Groups,sapply,function(i) i)))
+
+tmp <- human.to.all.ortho.binary.matrix[rownames(human.to.all.ortho.binary.matrix)%in%all.groups,]
+
+Global.list$Figure7$orthologs_matrix <-  tmp
+####### Find classification for species ####
+library(taxize)
+species <- colnames(Global.list$Figure7$orthologs_matrix)
+sp_good <- gnr_resolve(sci=species, best_match_only =  T)
+sp_good <- sp_good$matched_name[!duplicated(sp_good$user_supplied_name)]
+genus <- sapply(lapply(strsplit(sp_good," "),"[",c(1,2)),paste, collapse=" ")
+
+
+classification <- tax_name(query = genus, get = c("phylum","kingdom"), db = "itis",messages = F)
+class2 <-  tax_name(query = classification$query[is.na(classification$kingdom)], get = c("phylum","kingdom"), db = "ncbi",messages = F)
+class2$kingdom[grep("bacteria",class2$phylum)] <- "Bacteria"
+class2$kingdom[class2$kingdom=="Metazoa"]<- "Animalia"
+class2$kingdom[class2$kingdom=="Viridiplantae"]<- "Plantae"
+class2$kingdom[class2$phylum=="Apicomplexa"] <- "Protozoa"
+class2$kingdom[grep("Aquificae",class2$phylum)] <- "Bacteria"
+class2$kingdom[grep("Firmicutes",class2$phylum)] <- "Bacteria"
+class2$kingdom[grep("Chlorobi",class2$phylum)] <- "Bacteria"
+class2$kingdom[class2$query=="Wolbachia endosymbiont"] <- "Bacteria"
+class2$kingdom[class2$query=="Synechocystis C."] <- "Bacteria"
+
+
+class2$kingdom[is.na(class2$kingdom)] <- "Protozoa"
+classification$kingdom[classification$query=="Candidatus Koribacter"] <- "Bacteria"
+classification$kingdom[classification$query=="Phaeodactylum tricornutum"] <- "Protozoa"
+classification$kingdom[match(class2$query, classification$query)]  <- class2$kingdom
+classification$phylum[match(class2$query, classification$query)]  <- class2$phylum
+classification$in_matrix <- colnames(Global.list$Figure7$orthologs_matrix)
+class <- tax_name(query = classification$query[classification$kingdom=="Animalia"], get = c("class"), db = "ncbi",messages = F)
+classification$class <- NA
+classification$class[match(class$query, classification$query)] <- class$class
+classification$phylum[classification$query=="Ciona savignyi"] <- "Urochordata" ## asign urochordata to ascidea to remove from vertebrates
+classification$class[classification$query=="Anolis carolinensis"]<- "Reptilia"## assign Anolis class Reptilia
+Global.list$Figure7$Classification <- classification
+```
+
+
+```{r Conservation enrichment}
+Conservation.index <- as.data.frame(Conservation.index.GRanges)[,c("gene_name","conservation.index")]
+
+Groups.conservation <- list(Tolerant = lapply(Global.list$Groups$Tolerant, function(i) Conservation.index[Conservation.index$gene_name%in%i,]),
+                            Intolerant = lapply(Global.list$Groups$Intolerant, function(i) Conservation.index[Conservation.index$gene_name%in%i,]) )
+Global.list$Figure7$Conservation.Score <- list(All = Conservation.index,
+                                               Tolerant = Groups.conservation$Tolerant,
+                                               Intolerant = Groups.conservation$Intolerant)
+
+group.sizes <- sapply(Global.list$Groups$Tolerant, length)
+
+random.c.i. <- lapply(group.sizes, function(size)
+  sapply(1:10000, function(i) mean(sample(Global.list$Figure7$Conservation.Score$All$conservation.index,size),na.rm=T)))
+
+obs.c.i <- list(Tolerant = sapply(Global.list$Figure7$Conservation.Score$Tolerant,  function(i) mean(i$conservation.index,na.rm=T) ),
+                Intolerant = sapply(Global.list$Figure7$Conservation.Score$Intolerant,  function(i) mean(i$conservation.index,na.rm=T) ) )
+
+expected.c.i. <- list(mean = sapply(random.c.i.,mean),
+                      sd = sapply(random.c.i., sd) )
+
+C.I.z.score <- data.frame(Tolerant=(obs.c.i$Tolerant - expected.c.i.$mean)/expected.c.i.$sd,
+                    Intolerant=(obs.c.i$Intolerant - expected.c.i.$mean)/expected.c.i.$sd)
+Global.list$Figure7$zscore <- C.I.z.score
+```
+
+```{r C.I. distribution per taxa}
+tmp <- Global.list$Figure7$orthologs_matrix
+classification <- Global.list$Figure7$Classification
+##### Order columns by taxonomic kingdom ####
+tmp2 <- data.frame(K=classification$kingdom ,t(tmp))
+colnames(tmp2)[-1][(rownames(tmp)!=colnames(tmp2)[-1])] <- gsub( ".", "-",colnames(tmp2)[-1][(rownames(tmp)!=colnames(tmp2)[-1])], fixed = T) ## correct colnames changed in t()
+tmp2$K <- factor(tmp2$K, levels=c("Archaea", "Bacteria","Protozoa", "Fungi","Plantae","Animalia"))
+tmp2 <- tmp2[order(tmp2$K),]
+
+Animals <- tmp2[tmp2["K"]=="Animalia",-1]
+animals <- classification[match(rownames(Animals), classification$in_matrix), c("in_matrix","phylum","class")]
+Animals <- data.frame(animals[match(rownames(Animals), animals$in_matrix), c("phylum","class")], Animals )
+
+tmp3 <- cbind(Archaea_21sp = colSums(tmp2[tmp2["K"]=="Archaea",-1])/sum(tmp2["K"]=="Archaea"),
+              Bacteria_99sp = colSums(tmp2[tmp2["K"]=="Bacteria",-1])/sum(tmp2["K"]=="Bacteria"),
+              Protozoa_16sp = colSums(tmp2[tmp2["K"]=="Protozoa",-1])/sum(tmp2["K"]=="Protozoa"),
+              Fungi_8sp = colSums(tmp2[tmp2["K"]=="Fungi",-1])/sum(tmp2["K"]=="Fungi"),
+              Plants_9sp = colSums(tmp2[tmp2["K"]=="Plantae",-1])/sum(tmp2["K"]=="Plantae"),
+              Invertebrates_24sp = colSums(Animals[Animals$phylum!="Chordata",-c(1:2)])/sum(Animals$phylum!="Chordata"),
+              Vertebrates_10sp = colSums(Animals[Animals$phylum=="Chordata",-c(1:2)])/sum(Animals$phylum=="Chordata")) ## gene presence per taxa (# of appearances/#of species)
+
+
+tmp <- list(Intolerant = sapply(Global.list$Groups$Intolerant, function(i) tmp3[rownames(tmp3)%in%i,]),
+             Tolerant = sapply(Global.list$Groups$Tolerant, function(i) tmp3[rownames(tmp3)%in%i,]))
+
+Global.list$Figure7$CI_per_taxa$observed <- tmp
+########### Z-score #####
+ortho <- data.frame(K=classification$kingdom ,t(human.to.all.ortho.binary.matrix))
+
+Animals <- ortho[ortho["K"]=="Animalia",-1]
+animals <- classification[match(rownames(Animals), classification$in_matrix), c("in_matrix","phylum","class")]
+Animals <- data.frame(animals[match(rownames(Animals), animals$in_matrix), c("phylum","class")], Animals )
+
+tmp_rnd <- cbind(Archaea_21sp = colSums(ortho[ortho["K"]=="Archaea",-1])/sum(ortho["K"]=="Archaea"),
+              Bacteria_99sp = colSums(ortho[ortho["K"]=="Bacteria",-1])/sum(ortho["K"]=="Bacteria"),
+              Protozoa_16sp = colSums(ortho[ortho["K"]=="Protozoa",-1])/sum(ortho["K"]=="Protozoa"),
+              Fungi_8sp = colSums(ortho[ortho["K"]=="Fungi",-1])/sum(ortho["K"]=="Fungi"),
+              Plants_9sp = colSums(ortho[ortho["K"]=="Plantae",-1])/sum(ortho["K"]=="Plantae"),
+              Invertebrates_24sp = colSums(Animals[Animals$phylum!="Chordata",-c(1:2)])/sum(Animals$phylum!="Chordata"),
+              Vertebrates_10sp = colSums(Animals[Animals$phylum=="Chordata",-c(1:2)])/sum(Animals$phylum=="Chordata"))
+
+rnd.mean.dist <-  t(sapply(1:10000, function(i) colMeans(tmp_rnd[sample(1:nrow(tmp_rnd), 3083),])))
+
+obs.mean <- lapply(tmp, sapply, colMeans)
+rnd.mean <- colMeans(rnd.mean.dist)
+rnd.sd <- apply(rnd.mean.dist, 2, sd)
+
+z <- lapply(obs.mean, function(j) sapply(c("in_vivo","in_vitro"), function(i)  (j[,i]-rnd.mean)/rnd.sd))
+Global.list$Figure7$CI_per_taxa$zscore <- z
+Global.list$Figure7$CI_per_taxa$rnd.mean <- rnd.mean
+```
+
+```{r Percent of orthologs per taxa}
+tmp <- Global.list$Figure7$orthologs_matrix
+classification <- Global.list$Figure7$Classification
+##### Order columns by taxonomic kingdom ####
+tmp2 <- data.frame(K=classification$kingdom ,t(tmp))
+colnames(tmp2)[-1][(rownames(tmp)!=colnames(tmp2)[-1])] <- gsub( ".", "-",colnames(tmp2)[-1][(rownames(tmp)!=colnames(tmp2)[-1])], fixed = T) ## correct colnames changed in t()
+tmp2$K <- factor(tmp2$K, levels=c("Archaea", "Bacteria","Protozoa", "Fungi","Plantae","Animalia"))
+tmp2 <- tmp2[order(tmp2$K),]
+
+Animals <- tmp2[tmp2["K"]=="Animalia",-1]
+animals <- classification[match(rownames(Animals), classification$in_matrix), c("in_matrix","phylum","class")]
+Animals <- data.frame(animals[match(rownames(Animals), animals$in_matrix), c("phylum","class")], Animals )
+
+tmp3 <- cbind(Archaea_21sp = apply(tmp2[tmp2["K"]=="Archaea",-1],2,max),
+              Bacteria_99sp = apply(tmp2[tmp2["K"]=="Bacteria",-1],2,max),
+              Protozoa_16sp = apply(tmp2[tmp2["K"]=="Protozoa",-1],2,max),
+              Fungi_8sp = apply(tmp2[tmp2["K"]=="Fungi",-1],2,max),
+              Plants_9sp = apply(tmp2[tmp2["K"]=="Plantae",-1],2,max),
+              Invertebrates_24sp = apply(Animals[Animals$phylum!="Chordata",-c(1:2)],2,max),
+              Vertebrates_10sp = apply(Animals[Animals$phylum=="Chordata",-c(1:2)],2,max)) ## gene presence per taxa (if the gene appears in taxon=1, else=0)
+##### Number of orthologous genes per taxon
+tmp <- list(Intolerant = sapply(Global.list$Groups$Intolerant, function(i) m =tmp3[rownames(tmp3)%in%i,]),
+            Tolerant = sapply(Global.list$Groups$Tolerant, function(i) m =tmp3[rownames(tmp3)%in%i,] ) )
+
+obs <- lapply (tmp, sapply, function(m) colSums(m)*100/nrow(m))
+Global.list$Figure7$genes_per_taxa$observed <- obs
+### Z-score
+ortho <- data.frame(K=classification$kingdom ,t(human.to.all.ortho.binary.matrix))
+
+Animals <- ortho[ortho["K"]=="Animalia",-1]
+animals <- classification[match(rownames(Animals), classification$in_matrix), c("in_matrix","phylum","class")]
+Animals <- data.frame(animals[match(rownames(Animals), animals$in_matrix), c("phylum","class")], Animals )
+
+tmp_rnd <- cbind(Archaea_21sp = apply(ortho[ortho["K"]=="Archaea",-1],2,max),
+              Bacteria_99sp = apply(ortho[ortho["K"]=="Bacteria",-1],2,max),
+              Protozoa_16sp = apply(ortho[ortho["K"]=="Protozoa",-1],2,max),
+              Fungi_8sp = apply(ortho[ortho["K"]=="Fungi",-1],2,max),
+              Plants_9sp = apply(ortho[ortho["K"]=="Plantae",-1],2,max),
+              Invertebrates_24sp = apply(Animals[Animals$phylum!="Chordata",-c(1:2)],2,max),
+              Vertebrates_10sp = apply(Animals[Animals$phylum=="Chordata",-c(1:2)],2,max)) ## gene presence per taxa (if the gene appears in taxon=1, else=0)
+
+rnd.mean.dist <-  t(sapply(1:10000, function(i) {
+                m =tmp_rnd[sample(1:nrow(tmp_rnd),2961),]
+                colSums(m)*100/nrow(m)}))
+
+rnd.mean <- colMeans(rnd.mean.dist)
+rnd.sd <- apply(rnd.mean.dist, 2, sd)
+
+z <- lapply(obs, function(j) sapply(c("in_vivo","in_vitro"), function(i)  (j[,i]-rnd.mean)/rnd.sd))
+
+### Z-score
+ortho <- data.frame(K=classification$kingdom ,t(human.to.all.ortho.binary.matrix))
+
+Animals <- ortho[ortho["K"]=="Animalia",-1]
+animals <- classification[match(rownames(Animals), classification$in_matrix), c("in_matrix","phylum","class")]
+Animals <- data.frame(animals[match(rownames(Animals), animals$in_matrix), c("phylum","class")], Animals )
+
+tmp_rnd <- cbind(Archaea_21sp = apply(ortho[ortho["K"]=="Archaea",-1],2,max),
+              Bacteria_99sp = apply(ortho[ortho["K"]=="Bacteria",-1],2,max),
+              Protozoa_16sp = apply(ortho[ortho["K"]=="Protozoa",-1],2,max),
+              Fungi_8sp = apply(ortho[ortho["K"]=="Fungi",-1],2,max),
+              Plants_9sp = apply(ortho[ortho["K"]=="Plantae",-1],2,max),
+              Invertebrates_24sp = apply(Animals[Animals$phylum!="Chordata",-c(1:2)],2,max),
+              Vertebrates_10sp = apply(Animals[Animals$phylum=="Chordata",-c(1:2)],2,max)) ## gene presence per taxa (if the gene appears in taxon=1, else=0)
+
+rnd.mean.dist <-  t(sapply(1:10000, function(i) {
+                m =tmp_rnd[sample(1:nrow(tmp_rnd),2961),]
+                colSums(m)*100/nrow(m)}))
+
+rnd.mean <- colMeans(rnd.mean.dist)
+rnd.sd <- apply(rnd.mean.dist, 2, sd)
+
+z <- lapply(obs, function(j) sapply(c("in_vivo","in_vitro"), function(i)  (j[,i]-rnd.mean)/rnd.sd))
+
+
+
+
+#########################################################################
+Global.list$Figure7$genes_per_taxa$zscore <- z
+Global.list$Figure7$genes_per_taxa$rnd.mean <- rnd.mean
+```
+
+### Figure 4 : Conservation index
+```{r Figure 4 b Conservation index, echo=F}
+tmp <- melt(Global.list$Figure7$Conservation.Score)
+tmp$L2[is.na(tmp$L2)] <- "All"
+
+### Conservation index z score ####
+tmpz <- melt(as.matrix(Global.list$Figure7$zscore))
+tmpz$pval <- convert.z.score(tmpz$value)
+tmpz$signif <- symnum(tmpz$pval,corr = F, na=F, cutpoints=c(0,.0001,.001,.05,1), symbols = c("***", "**", "*", "n.s."))
+tmpz$Var1 <- factor(tmpz$Var1, levels=c("in_vivo","in_vitro"))
+
+ggplot(tmpz, aes(x=Var1, y= value)) + 
+  geom_bar(aes(fill=Var2, color=Var2),stat="identity", alpha=0.7)+
+  geom_hline(yintercept = 0,linetype="dashed") + xlab("")+ylab("Z score") + 
+  scale_fill_manual(values = c(ccols[1],ccols[2])) + theme_pubr()+
+  scale_color_manual(values = c(ccols[1],ccols[2])) + 
+  theme(legend.position = "", axis.text = element_text(size=12))+ 
+  geom_text(aes(label=signif),position = position_identity(), size=8)+ 
+  scale_x_discrete(labels=c("in_vivo" = "in vivo", "in_vitro" = "in vitro"))
+```
+
+
+```{r Figure 4 a Orthologs heatmap}
+### Orthologs heatmap ####
+tmp <- Global.list$Figure7$orthologs_matrix
+classification <- Global.list$Figure7$Classification
+##### Order columns by taxonomic kingdom ####
+tmp2 <- data.frame(K=classification$kingdom ,t(tmp))
+colnames(tmp2)[-1][(rownames(tmp)!=colnames(tmp2)[-1])] <- gsub( ".", "-",colnames(tmp2)[-1][(rownames(tmp)!=colnames(tmp2)[-1])], fixed = T) ## correct colnames changed in t()
+tmp2$K <- factor(tmp2$K, levels=c("Archaea", "Bacteria","Protozoa", "Fungi","Plantae","Animalia"))
+tmp2 <- tmp2[order(tmp2$K),]
+Animals <- tmp2[tmp2["K"]=="Animalia",-1]
+animals <- classification[match(rownames(Animals), classification$in_matrix), c("in_matrix","phylum","class")]
+Animals <- data.frame(animals[match(rownames(Animals), animals$in_matrix), c("phylum","class")], Animals )
+
+tmp3 <- cbind(Archaea_21sp = as.numeric(colSums(tmp2[tmp2["K"]=="Archaea",-1])!=0),
+              Bacteria_99sp = as.numeric(colSums(tmp2[tmp2["K"]=="Bacteria",-1])!=0),
+              Protozoa_16sp = as.numeric(colSums(tmp2[tmp2["K"]=="Protozoa",-1])!=0), 
+              Fungi_8sp = as.numeric(colSums(tmp2[tmp2["K"]=="Fungi",-1])!=0),
+              Plants_9sp = as.numeric(colSums(tmp2[tmp2["K"]=="Plantae",-1])!=0),
+              Invertebrates_24sp = as.numeric(colSums(Animals[Animals$phylum!="Chordata",-c(1:2)])!=0),
+              Vertebrates_10sp = as.numeric(colSums(Animals[Animals$phylum=="Chordata",-c(1:2)])!=0))
+rownames(tmp3) <- colnames(tmp2)[-1]
+
+
+columns <-  factor(colnames(tmp3), levels=c("Archaea_21sp", "Bacteria_99sp", "Protozoa_16sp", "Fungi_8sp", "Plants_9sp", "Invertebrates_24sp","Vertebrates_10sp"))
+tmp3 <- tmp3[,order(columns,colSums(tmp3))] ## order columns by taxa
+
+in_vivo <- rep("_",nrow(tmp3))
+in_vivo[rownames(tmp3)%in%Global.list$Groups$Tolerant$in_vivo] <- "Tolviv"
+in_vivo[rownames(tmp3)%in%Global.list$Groups$Intolerant$in_vivo] <- "Intviv"
+
+in_vitro <- rep("_",nrow(tmp3))
+in_vitro[rownames(tmp3)%in%Global.list$Groups$Tolerant$in_vitro] <- "Tolvit"
+in_vitro[rownames(tmp3)%in%Global.list$Groups$Intolerant$in_vitro] <- "Intvit"
+
+##
+all <- paste0(in_vivo, in_vitro)
+all <- factor(all, levels=c("IntvivIntvit", "Intviv_","_Intvit",  "TolvivIntvit","IntvivTolvit","_Tolvit","Tolviv_","TolvivTolvit"))
+
+
+tmp3 <- tmp3[order(all, -rowSums(tmp3)),] ## order rows by intolerant/tolerant
+
+row_ha <- HeatmapAnnotation(df = data.frame(in_vivo = in_vivo[order(all, -rowSums(tmp3))],
+                                            in_vitro = in_vitro[order(all, -rowSums(tmp3))]),
+                            col = list(in_vivo = c("Tolviv" = ccols[2], "Intviv" = ccols[1], "_"="white" ),
+                                       in_vitro = c("Tolvit" = ccols[2], "Intvit" = ccols[1], "_"="white" )),
+                            show_legend = F, which = "row", width = unit(1, "cm"))
+
+ordered.ci <- Global.list$Figure7$Conservation.Score$All$conservation.index[match(rownames(tmp3), Global.list$Figure7$Conservation.Score$All$gene_name)]
+
+left_ha <- HeatmapAnnotation(df = data.frame(C.I. = ordered.ci),
+                            col = list(C.I. = colorRamp2(c(0,1),c("white","darkred"))),
+                            show_legend = T, which = "row", width = unit(.5, "cm"))
+row_ha+ Heatmap(tmp3, cluster_rows = F, cluster_columns = F, show_column_names =T, show_row_names = F,
+                col = colorRamp2(c(0,1), c( "white", "darkgray")), column_names_gp = gpar(fontsize = 8), show_heatmap_legend = F) +left_ha
+```
+
+```{r CI per taxa}
+x <- melt(Global.list$Figure7$CI_per_taxa$observed)
+x$value <- (x$value*100)+.1
+x$L2 <- factor(x$L2, levels=c("in_vivo", "in_vitro"))
+
+p1 <- ggviolin(x, x="Var2", y="value", color="L2", scale="width", width=0.7, trim=T, size=1, add = "mean", add.params = list(group="L2", shape=21))+
+  scale_y_log10()+xlab("") + ylab("C.I. (per taxa)")+facet_grid(.~L1)+
+  scale_fill_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1]))+
+  scale_color_manual(values = c("in_vivo"=ccols[4],"in_vitro"=ccols[3]))+
+  theme(axis.text.y=element_text(size=8), axis.title.y = element_text(size=9),axis.text.x = element_text(size=8, angle=45, hjust=1),legend.position = "")
+
+#### z score ####
+tmp <- melt(Global.list$Figure7$CI_per_taxa$zscore)
+tmp$pval <- convert.z.score(tmp$value)
+tmp$signif <- symnum(tmp$pval,corr = F, na=F, cutpoints=c(0,.0001,.001,.05,1), symbols = c("***", "**", "*", "n.s."))
+
+p2 <- ggbarplot(tmp, x="Var1", y="value", color="Var2", fill="Var2", position = position_dodge(), label = tmp$signif, lab.vjust = .5,lab.size = 4) +
+  ylab("z score")+facet_grid(.~L1)+xlab("")+
+  scale_fill_manual(values = c("in_vivo"=ccols[4],"in_vitro"=ccols[3]))+
+  scale_color_manual(values = c("in_vivo"=ccols[4],"in_vitro"=ccols[3]))+
+  theme(axis.text.y=element_text(size=8), axis.title.y = element_text(size=9),axis.text.x = element_text(size=8, angle=45, hjust=1),legend.position = "")
+
+  multiplot(p1,p2,cols=1)
+```
+
+```{r % orthologs per taxa }
+x <- melt(lapply(Global.list$Figure7$genes_per_taxa$observed, 
+                 function(i) cbind(i, random=Global.list$Figure7$genes_per_taxa$rnd.mean)))
+
+x$Var1 <- factor(x$Var1, levels=c("Archaea_21sp","Bacteria_99sp","Plants_9sp","Fungi_8sp","Protozoa_16sp","Invertebrates_24sp","Vertebrates_10sp"))
+x$Var2 <- factor(x$Var2, levels=c("random", "in_vivo", "in_vitro"))
+
+p1 <- ggscatter(x, x="Var1", y="value", color="Var2", shape = "Var2", size=3)+
+  geom_line(aes(group=Var2, color=Var2), size=1, linetype="dashed")+
+  xlab("") + ylab("% of genes per taxa")+facet_grid(.~L1)+
+  scale_fill_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1]))+
+  scale_color_manual(values = c("in_vivo"=alpha(ccols[4],.8),"in_vitro"=alpha(ccols[3],.8), random="black"))+
+  scale_shape_manual(values = c("in_vivo"=19,"in_vitro"=19, "random"=8))+
+  theme(axis.text.y=element_text(size=8), axis.title.y = element_text(size=9),axis.text.x = element_text(size=8, angle=45, hjust=1),legend.position = "")
+
+#### z score ####
+tmp <- melt(Global.list$Figure7$genes_per_taxa$zscore)
+tmp$pval <- convert.z.score(tmp$value)
+tmp$signif <- symnum(tmp$pval,corr = F, na=F, cutpoints=c(0,.0001,.001,.05,1), symbols = c("***", "**", "*", "n.s."))
+tmp$Var1 <- factor(tmp$Var1, levels=c("Archaea_21sp","Bacteria_99sp","Plants_9sp","Fungi_8sp","Protozoa_16sp","Invertebrates_24sp","Vertebrates_10sp"))
+
+p2 <- ggbarplot(tmp, x="Var1", y="value", color="Var2", fill="Var2", position = position_dodge(), label = tmp$signif, lab.vjust = .5,lab.size = 4) +
+  ylab("z score")+facet_grid(.~L1)+xlab("")+
+  scale_fill_manual(values = c("in_vivo"=ccols[4],"in_vitro"=ccols[3]))+
+  scale_color_manual(values = c("in_vivo"=ccols[4],"in_vitro"=ccols[3]))+
+  theme(axis.text.y=element_text(size=8), axis.title.y = element_text(size=9),axis.text.x = element_text(size=8, angle=45, hjust=1),legend.position = "")
+
+  multiplot(p1,p2,cols=1)
+```
+
+
+## Result 5: OGEE Gene duplication, developmental expression and early expression
+```{r}
+Global.list$OGEE$data <- OGEE_data
+```
+### Duplications
+```{r OGEE dupgenes}
+tmp <- Global.list$OGEE$data$duplications[,c("symbol", "familyMemberCount")]
+
+Obs_duplications <- lapply(Global.list$Groups, lapply, function(i) tmp$familyMemberCount[tmp$symbol %in% i])
+
+sizes <- sapply(Global.list$Groups$Tolerant, length )
+rand_dup <- lapply(sizes, function(c) sapply(1:10000, function(j) table(tmp$familyMemberCount[tmp$symbol%in%sample(Annotated.Ensembl.gene.annotation.GRCh38.GRanges$symbol, c)])))
+
+Global.list$OGEE$dupgenes$obs_dup <- Obs_duplications
+Global.list$OGEE$dupgenes$rand_dup <- rand_dup
+```
+
+```{r fig4 d}
+### Singletons vs duplicated #####
+obs_count <- lapply(Global.list$OGEE$dupgenes$obs_dup, sapply, function(i) table(i)) 
+obs_single_dup <-lapply(obs_count, sapply, function(i){
+                 ref = as.numeric(names(i))
+                  x= c(single = sum(i[ref==1]),
+                       dup = sum(i[ref>1]))
+                  return(x*100/sum(x)) }) 
+
+rand_single_dup <- lapply(Global.list$OGEE$dupgenes$rand_dup,sapply, function(i){
+  ref = as.numeric(names(i))
+  x=  c(single = sum(i[ref==1]),
+        dup = sum(i[ref>1]))
+  return(x*100/sum(x))}) 
+
+exp_single_dup_mean <- sapply(rand_single_dup, rowMeans)
+exp_single_dup_sd <- sapply(rand_single_dup, apply,1, sd)
+
+single_dup_z <- lapply(obs_single_dup, function(i) (i- exp_single_dup_mean)/exp_single_dup_sd )
+
+signif <- melt(single_dup_z)
+signif$pval <- convert.z.score(signif$value)
+signif$sl <- symnum(signif$pval,corr = F, na=F, cutpoints=c(0,.0001,.001,.05,1), symbols = c("***", "**", "*", "n.s."))
+
+p1 <- ggbarplot(signif,x="Var1", y="value", color="L1", fill="L1", facet.by = "Var2", label=signif$sl, lab.size = 8, lab.vjust = 1)+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  scale_fill_manual(values=c("Tolerant"=ccols[2],"Intolerant"=ccols[1]))+
+  scale_color_manual(values=c("Tolerant"=ccols[2],"Intolerant"=ccols[1]))+
+  xlab("")+ylab("z score")+ 
+  scale_x_discrete(labels=c("single" = "Singleton", "dup" = "Duplicated"))
+p1
+```
+
+### Early expression
+```{r OGEE early expression}
+Global.list$OGEE$data$early_expr$earliestExprStage <- factor(as.character(Global.list$OGEE$data$early_expr$earliestExprStage) )
+Obs_early_expr <- lapply(Global.list$Groups, lapply, function(i)
+  Global.list$OGEE$data$early_expr$earliestExprStage[Global.list$OGEE$data$early_expr$symbol %in% i])
+Obs_count <- lapply(Obs_early_expr, sapply, table)
+
+sizes <- lapply(Obs_early_expr, sapply, length)
+rand_counts <- lapply(sizes, lapply, function(i) sapply(1:10000, function(j) table(Global.list$OGEE$data$early_expr$earliestExprStage[sample(1:length(Global.list$OGEE$data$early_expr$earliestExprStage),i)])))
+
+exp_mean <- lapply(rand_counts, sapply, rowMeans)
+exp_sd <- lapply(rand_counts, sapply, apply,1,sd)
+
+z_score <- lapply(names(Obs_count), function(i) sapply(colnames(Obs_count[[i]]), function(j) (Obs_count[[i]][,j]-exp_mean[[i]][,j])/exp_sd[[i]][,j] ))
+names(z_score) <- names(Obs_count)
+
+Global.list$OGEE$early_exp$obs <- Obs_early_expr
+Global.list$OGEE$early_exp$obs_count <- Obs_count
+Global.list$OGEE$early_exp$expected <- exp_mean
+Global.list$OGEE$early_exp$z_score <- z_score
+```
+
+```{r Fig6 a}
+### Percent of expressed genes by stage ####
+pval <- lapply(Global.list$OGEE$early_exp$z_score, function(i) convert.z.score(as.matrix(i)))
+tmpsignif <- lapply(pval, function(i) symnum(i,corr = F, na=F, cutpoints=c(0,.0001,.001,.05,1), symbols = c("***", "**", "*", "n.s."),abbr.colnames = F))
+
+Obs_percent <- c(lapply(Global.list$OGEE$early_exp$obs_count, function(i) apply(i, 2, function(j) j*100/sum(j))),
+                 list(  Expected = apply(Global.list$OGEE$early_exp$expected$Tolerant, 2, function(j) j*100/sum(j))))
+
+tmp <- melt(Obs_percent)
+stage_order <- Global.list$OGEE$data$early_expr[!duplicated(Global.list$OGEE$data$early_expr$earliestExprStage),5:6]
+stage_order <- stage_order[order(stage_order[,2]),]
+tmp$Var1 <- factor(tmp$Var1, levels=as.character(stage_order[,1]))
+
+p1<-ggline(tmp, x="Var1",y="value", color="L1",facet.by = "Var2", size=1.5)+
+  scale_color_manual(values = c("Tolerant"= ccols[2], "Intolerant" = ccols[1], "Expected"=alpha("darkgray",.6)))+
+  theme(axis.text.x = element_text(size=8,angle=90,hjust=1, vjust=.5))+ xlab("")+ylab("%")
+  
+p1_inset <-ggline(tmp[tmp$Var1!="embryoid body"&tmp$Var1!="fetus"&tmp$Var1!="blastocyst",], x="Var1",y="value", color="L1",facet.by = "Var2", size=1.5, scale="free_y")+
+  scale_color_manual(values = c("Tolerant"= ccols[2], "Intolerant" = ccols[1], "Expected"=alpha("darkgray",.6)))+
+  theme(axis.text.x = element_text(size=8,angle=90,hjust=1, vjust=.5))+ xlab("")+ylab("%")
+
+#### Cumulative distribution ####
+cdfs <- lapply(Obs_percent, function(i) apply(i[match(stage_order$earliestExprStage, rownames(i)),],2,cumsum))
+
+tmp <- melt(cdfs)
+tmp$Var1 <- factor(tmp$Var1, levels=as.character(stage_order[,1]))
+
+p2 <- ggline(tmp, x="Var1",y="value", color="L1", size=1.5)+facet_grid(Var2~., scales = "free_y")+
+  scale_color_manual(values = c("Tolerant"= ccols[2], "Intolerant" = ccols[1], "Expected"=alpha("darkgray",.6)))+
+  theme(axis.text.x = element_text(size=8,angle=90,hjust=1, vjust=.5))+ xlab("")+ylab("%")
+### Deviation by stage####
+tmp <- melt(Global.list$OGEE$early_exp$z_score)
+tmp$pval <- convert.z.score(tmp$value)
+tmp$signif <- symnum(tmp$pval,corr = F, na=F, cutpoints=c(0,.0001,.001,.05,1), symbols = c("***", "**", "*", "n.s."),abbr.colnames = F)
+stage_order <- Global.list$OGEE$data$early_expr[!duplicated(Global.list$OGEE$data$early_expr$earliestExprStage),5:6]
+stage_order <- stage_order[order(stage_order[,2]),]
+tmp$Var1 <- factor(tmp$Var1, levels=as.character(stage_order[,1]))
+
+p3 <-ggplot(tmp,aes(x=Var1, y=value, color=L1))+ facet_grid(.~Var2)+
+  geom_segment(aes( xend=Var1, yend=0), color="gray")+
+  geom_point(size = 4)+ geom_text(aes(label=signif), size=6, color="black")+
+  scale_color_manual(values = c("Tolerant"= ccols[2], "Intolerant" = ccols[1]))+
+  geom_hline(yintercept = 0, linetype="dashed")+xlab("")+ylab("z score")+
+  theme_pubr()+ theme(axis.text.x = element_text(angle = 90, hjust=1,vjust=.5, size=9))
+
+p1;p1_inset;
+p2;p3
+```
+
+### Developmental genes
+```{r OGEE dev genes}
+x <- data.frame( table(Global.list$OGEE$data$devgenes$GOTerm))
+x <- x[x$Freq>150,]
+
+tmp <- Global.list$OGEE$data$devgenes[Global.list$OGEE$data$devgenes$GOTerm%in%x$Var1,c("symbol","GOTerm")]
+tmp$GOTerm <- factor(as.character(tmp$GOTerm))
+
+Obs_dev_genes <- lapply(Global.list$Groups, lapply, function(i) tmp$GOTerm[tmp$symbol %in% i])
+Obs_count <- lapply(Obs_dev_genes, sapply, table)
+
+sizes <- sapply(Global.list$Groups$Tolerant, length )
+rand_counts <- lapply(sizes, function(i) sapply(1:10000, function(j) table(tmp$GOTerm[tmp$symbol %in% sample( Annotated.Ensembl.gene.annotation.GRCh38.GRanges$symbol, i)])))
+
+exp_mean <- sapply(rand_counts, rowMeans)
+exp_sd <- sapply(rand_counts, apply,1,sd)
+
+z_score <- lapply(Obs_count, function(i) (i-exp_mean)/exp_sd )
+
+Global.list$OGEE$dev_genes$obs <- Obs_dev_genes
+Global.list$OGEE$dev_genes$obs_count <- Obs_count
+Global.list$OGEE$dev_genes$expected <- exp_mean
+Global.list$OGEE$dev_genes$z_score <- z_score
+```
+
+```{r Fig 6 b }
+##### Number of genes per category ###
+pval <- lapply(Global.list$OGEE$dev_genes$z_score, function(i) convert.z.score(as.matrix(i)))
+tmpsignif <- lapply(pval, function(i) symnum(i,corr = F, na=F, cutpoints=c(0,.0001,.001,.05,1), symbols = c("***", "**", "*", "n.s."),abbr.colnames = F))
+
+tmp <- Global.list$OGEE$dev_genes$obs_count
+tmp$Expected <- Global.list$OGEE$dev_genes$expected
+
+tmp <- melt(tmp)
+tmp$Var1 <- as.factor(sapply(strsplit(as.character(tmp$Var1)," development"),"[",1))
+tmp$Var1 <- as.factor(sapply(strsplit(as.character(tmp$Var1)," formation"),"[",1))
+
+p1 <- ggplot(tmp, aes(x=reorder(Var1,value),y=value, color=L1, group=L1))+
+  geom_line(size=1)+ 
+  geom_point(size=3)+ 
+  facet_grid(Var2~., scales = "free_y")+ scale_y_continuous(limits=c(0,240))+
+  scale_color_manual(values = c("Tolerant"= ccols[2], "Intolerant" = ccols[1], "Expected"=alpha("darkgray",.6)))+
+  theme_pubr()+ theme(axis.text.x = element_text(size=8,angle=90,hjust=1, vjust=.5))+ xlab("")+ylab("n genes")
+
+### deviation per category ###
+tmp <- melt(Global.list$OGEE$dev_genes$z_score)
+tmp$pval <- convert.z.score(tmp$value)
+tmp$signif <- symnum(tmp$pval,corr = F, na=F, cutpoints=c(0,.0001,.001,.05,1), symbols = c("***", "**", "*", "n.s."),abbr.colnames = F)
+tmp$Var1 <- as.factor(sapply(strsplit(as.character(tmp$Var1)," development"),"[",1))
+tmp$Var1 <- as.factor(sapply(strsplit(as.character(tmp$Var1)," formation"),"[",1))
+
+tmp$Var1 <- factor(tmp$Var1, levels = levels(tmp$Var1)[c(5,2,7,3,4,6,1)])
+
+p2 <-ggplot(tmp, aes(x=Var1,y=value, color=L1, group=L1))+
+  geom_point(size=4)+
+  geom_segment(aes( xend=Var1, yend=0), color="gray")+
+  geom_text(aes(label=signif), size=5, color="black")+
+  facet_grid(.~Var2, scales = "free_y")+
+  scale_color_manual(values = c("Tolerant"= ccols[2], "Intolerant" = ccols[1]))+
+  geom_hline(yintercept = 0, linetype="dashed")+xlab("")+ylab("z score")+
+  theme_pubr() + theme(axis.text.x = element_text(size=8,angle=90,hjust=1, vjust=1))
+
+p1; p2;
+```
+## Result 6: Tissue expression enrichment
+### Tissue preferential expression 
+#### GTEx 
+```{r GTEx Tissue specificity}
+GTEx.allExps <- getAtlasData("E-MTAB-5214")
+GTEx.allExps <- experimentSummary@listData$rnaseq
+
+GTEx_countmatrix <- (assays(GTEx.allExps)$counts) ## Get counts matrix
+exps <- colData(GTEx.allExps) ### Get experiments data (columns)
+
+colnames(GTEx_countmatrix) <- exps$organism_part[match(colnames(GTEx_countmatrix),rownames(exps))] ## rename columns by body part
+
+########## Enrichment using count matrix #####
+GTEx_countmatrix <- GTEx_countmatrix[rownames(GTEx_countmatrix)%in%Annotated.Ensembl.gene.annotation.GRCh38.GRanges$ensembl[!duplicated(Annotated.Ensembl.gene.annotation.GRCh38.GRanges$symbol)], ] ## subset counts matrix to keep only annotated genes with unique hgnc symbol
+
+rownames(GTEx_countmatrix) <- Annotated.Ensembl.gene.annotation.GRCh38.GRanges$symbol[match(rownames(GTEx_countmatrix),Annotated.Ensembl.gene.annotation.GRCh38.GRanges$ensembl)] ## change rownames to have gene symbols
+
+colnames(GTEx_countmatrix) <- make.names(colnames(GTEx_countmatrix))
+
+GTEx_enrichment <- GenerateEnrichmentScore(data = GTEx_countmatrix, groups = colnames(GTEx_countmatrix))
+```
+
+```{r GTEx enrichment by gene set}
+Global.list$Tissue_enrichment$GTEx_enrich_mat <- GTEx_enrichment
+Global.list$Tissue_enrichment$GTEx_expr_mat <- GTEx_countmatrix
+
+tmp <- Global.list$Tissue_enrichment$GTEx_enrich_mat
+
+GTEx_enrich_groups <- list(
+  Tolerant = lapply(Global.list$Groups$Tolerant, function(i) tmp[rownames(tmp)%in%i, ]),
+  Intolerant = lapply(Global.list$Groups$Intolerant, function(i) tmp[rownames(tmp)%in%i, ] ) )
+
+
+group.sizes <- sapply(Global.list$Groups$Tolerant, length)
+random_enrich <- lapply(group.sizes, function(i) t(sapply(1:10000, function(j) apply(tmp[sample(1:nrow(tmp), i), ],2,mean))) )
+
+Global.list$Tissue_enrichment$GTEx_groups_enrich <- GTEx_enrich_groups
+Global.list$Tissue_enrichment$GTEx_random_enrich <- random_enrich
+
+
+expected_mean <- sapply(random_enrich, function(i) apply(i,2,mean))
+expected_sd <- sapply(random_enrich, function(i) apply(i,2,sd))
+obs_mean <- lapply(GTEx_enrich_groups, sapply, function(i) apply(i,2,mean))
+
+enrichment_z_score <- list(
+  Tolerant= sapply(c("in_vivo","in_vitro"),
+                   function(i) (obs_mean$Tolerant[,i]-expected_mean[,i])/expected_sd[,i]),
+  Intolerant= sapply(c("in_vivo","in_vitro"),
+                   function(i) (obs_mean$Intolerant[,i]-expected_mean[,i])/expected_sd[,i]))
+
+Global.list$Tissue_enrichment$GTEx_enrich_zscore <- enrichment_z_score
+```
+#### HPA
+```{r HPA Tissue specificity}
+HPA.allExps <- getAtlasData("E-MTAB-2836")
+HPA.allExps <- HPA.allExps@listData$`E-MTAB-2836`$rnaseq
+
+HPA_countmatrix <- (assays(HPA.allExps)$counts) ## Get counts matrix
+exps <- colData(HPA.allExps) ### Get experiments data (columns)
+
+colnames(HPA_countmatrix) <- exps$organism_part[match(colnames(HPA_countmatrix),rownames(exps))] ## rename columns by body part
+
+########## Enrichment using count matrix #####
+HPA_countmatrix <- HPA_countmatrix[rownames(HPA_countmatrix)%in%Annotated.Ensembl.gene.annotation.GRCh38.GRanges$ensembl[!duplicated(Annotated.Ensembl.gene.annotation.GRCh38.GRanges$symbol)], ] ## subset counts matrix to keep only annotated genes with unique hgnc symbol
+
+rownames(HPA_countmatrix) <- Annotated.Ensembl.gene.annotation.GRCh38.GRanges$symbol[match(rownames(HPA_countmatrix),Annotated.Ensembl.gene.annotation.GRCh38.GRanges$ensembl)] ## change rownames to have gene symbols
+
+colnames(HPA_countmatrix) <- make.names(colnames(HPA_countmatrix))
+
+HPA_enrichment <- GenerateEnrichmentScore(data = HPA_countmatrix, groups = colnames(HPA_countmatrix))
+```
+
+```{r HPA enrichment by gene set, echo=F}
+Global.list$Tissue_enrichment$HPA_enrich_mat <- HPA_enrichment
+Global.list$Tissue_enrichment$HPA_expr_mat <- HPA_countmatrix
+
+tmp <- Global.list$Tissue_enrichment$HPA_enrich_mat
+
+HPA_enrich_groups <- list(
+  Tolerant = lapply(Global.list$Groups$Tolerant, function(i) tmp[rownames(tmp)%in%i, ]),
+  Intolerant = lapply(Global.list$Groups$Intolerant, function(i) tmp[rownames(tmp)%in%i, ] ) )
+
+group.sizes <- sapply(Global.list$Groups$Tolerant, length)
+
+random_enrich <- lapply(group.sizes, function(i) t(sapply(1:10000, function(j) apply(tmp[sample(1:nrow(tmp), i), ],2,mean))) )
+
+expected_mean <- sapply(random_enrich, function(i) apply(i,2,mean))
+expected_sd <- sapply(random_enrich, function(i) apply(i,2,sd))
+obs_mean <- lapply(HPA_enrich_groups, sapply, function(i) apply(i,2,mean))
+
+enrichment_z_score <- list(
+  Tolerant= sapply(c("in_vivo","in_vitro"),
+                   function(i) (obs_mean$Tolerant[,i]-expected_mean[,i])/expected_sd[,i]),
+  Intolerant= sapply(c("in_vivo","in_vitro"),
+                   function(i) (obs_mean$Intolerant[,i]-expected_mean[,i])/expected_sd[,i]))
+
+Global.list$Tissue_enrichment$HPA_groups_enrich <- HPA_enrich_groups
+Global.list$Tissue_enrichment$HPA_random_enrich <- random_enrich
+Global.list$Tissue_enrichment$HPA_enrich_zscore <- enrichment_z_score
+```
+
+### Figure 6 : Tissue expression enrichment
+```{r GTEx tissue enrichment plots}
+### Tissue z-score ####
+tmpz <- Global.list$Tissue_enrichment$GTEx_enrich_zscore
+tmpz <- lapply(tmpz, function(i) i[-grep("transformed", rownames(tmpz$Intolerant)),]) ## remove cell lines (trandformed lympocyte and fibroblast)
+
+##### Tissues with differential expression of tolerant/intolerant genes (Rank log ratio) #### 
+rank_log_ratio <- lapply(c("in_vivo","in_vitro"), function(i) log(rank(tmpz$Intolerant[,i])/ rank(tmpz$Tolerant[,i])) )
+names(rank_log_ratio) <- c("in_vivo","in_vitro")
+
+tmp <- lapply (c("in_vivo","in_vitro"), function(i) data.frame(Intolerant=tmpz$Intolerant[,i], Tolerant=tmpz$Tolerant[,i]) )
+names(tmp) <- c("in_vivo","in_vitro")
+
+x <- data.frame(tissue=rep(paste0(rownames(tmp$in_vivo)," (", rank(-rank_log_ratio$in_vivo),")"),2),
+           z=c(tmp$in_vivo[,1], tmp$in_vivo[,2]),
+           rank_log = rep(rank_log_ratio$in_vivo,2), 
+           type=c(rep("Intolerant",51),rep("Tolerant",51)))
+
+p1 <- ggplot(x, aes(x=reorder(tissue,rank_log),y=z, color=type))+
+  geom_segment(aes( xend=reorder(tissue,rank_log), yend=0), color="gray")+
+  geom_point(size=2)+xlab("")+
+  theme_pubclean()+theme(legend.position = "",axis.text = element_text(size=7))+
+  geom_hline(yintercept =c(-1.96, 0,1.96), linetype="dashed")+
+  scale_color_manual(values = c("Tolerant"=ccols[2], "Intolerant" = ccols[1]))+
+  coord_flip()+ggtitle("in vivo")
+
+
+x <- data.frame(tissue=rep(rank(-rank_log_ratio$in_vivo),2),
+           z=c(tmp$in_vitro[,1], tmp$in_vitro[,2]),
+           rank_log = rep(rank_log_ratio$in_vitro,2), 
+           type=c(rep("Intolerant",51),rep("Tolerant",51)))
+
+p2 <- ggplot(x, aes(x=reorder(tissue,rank_log),y=z, color=type))+
+  geom_segment(aes( xend=reorder(tissue,rank_log), yend=0), color="gray")+
+  geom_point(size=2)+xlab("")+
+  theme_pubclean()+theme(axis.text = element_text(size=6), legend.position = "")+
+  geom_hline(yintercept = c(-1.96,0,1.96), linetype="dashed")+
+  scale_color_manual(values = c("Tolerant"=ccols[2], "Intolerant" = ccols[1]))+
+  coord_flip()+ggtitle("in vitro")
+
+p1
+p2
+```
+
+```{r}
+#############################################################################
+  ## rank log ratio heatmaps
+## in vivo
+Heatmap(data.frame(rank.log.ratio = sort(rank_log_ratio$in_vivo,decreasing = T)),
+        cluster_rows = F, cluster_columns = F, show_column_names =F, show_row_names = F,
+        col = colorRamp2(c(-4,0,4), c("steelblue", "white", "darkred")), row_names_gp = gpar(fontsize = 8), 
+        show_heatmap_legend = T, column_title = "rank log ratio", name = "in vivo", width=unit(.1,"in"))
+# in vitro
+Heatmap(data.frame(rank.log.ratio = sort(rank_log_ratio$in_vitro,decreasing = T)),
+        cluster_rows = F, cluster_columns = F, show_column_names =F, show_row_names = F,
+        col = colorRamp2(c(-4,0,4), c("steelblue", "white", "darkred")), row_names_gp = gpar(fontsize = 8), 
+        show_heatmap_legend = T, column_title = "rank log ratio", name = "in vitro", width=unit(.1,"in"))
+
+```
+
+## Result 7: Subgroups analyses
+
+Subgroups: Consistent Tolerant
+           Consistent Intolerant
+           Tolerant in vivo & Intolerant in vitro
+           Tolerant in vitro & Intolerant in vivo
+### Quantitative tolerance measurement comparison
+```{r}
+subgroup.ranks <- lapply(Global.list$mean.ranks, function(i) lapply(Global.list$Subgroups, lapply, function(j) i[names(i)%in%j]))
+tmp <- melt(subgroup.ranks)
+tmp$L3 <- factor(tmp$L3, levels=c("Tolerant", "TvivoIvitro","IvivoTvitro","Intolerant"))
+
+ggboxplot(tmp, x="L1", color="L3", y="value")+ylab("mean rank")+xlab("")+theme(legend.title = element_blank())+
+  scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1], "TvivoIvitro"=ccols[5],"IvivoTvitro"=ccols[6]))+
+  scale_x_discrete(labels=c("organismal fitness", "cellular viability"))
+
+```
+### Network properties
+#### Module size
+```{r module size, eval=F, include=F }
+Subgroups.Module.Sizes <- list(Consistent = lapply(Global.list$Subgroups$Consistent, function(i) Test.Module.Size (Network, i)),
+                               Inconsistent = lapply(Global.list$Subgroups$Inconsistent, function(i) Test.Module.Size (Network, i)))
+Subgroups.List <- list(Network=list(module.size=Subgroups.Module.Sizes))
+
+### Z score ####
+rnd <- list(size = list(Consistent = list(Tolerant = Subgroups.List$Network$module.size$Consistent$Tolerant$rand.sizes[,1],
+                                           Intolerant = Subgroups.List$Network$module.size$Consistent$Intolerant$rand.sizes[,1]),
+                         Inconsistent = list(TvivoIvitro = Subgroups.List$Network$module.size$Inconsistent$TvivoIvitro$rand.sizes[,1],
+                                             IvivoTvitro = Subgroups.List$Network$module.size$Inconsistent$IvivoTvitro$rand.sizes[,1])),
+                 connectivity = list(Consistent = list(Tolerant = Subgroups.List$Network$module.size$Consistent$Tolerant$rand.sizes[,2],
+                                           Intolerant = Subgroups.List$Network$module.size$Consistent$Intolerant$rand.sizes[,2]),
+                                     Inconsistent = list(TvivoIvitro = Subgroups.List$Network$module.size$Inconsistent$TvivoIvitro$rand.sizes[,2],
+                                             IvivoTvitro = Subgroups.List$Network$module.size$Inconsistent$IvivoTvitro$rand.sizes[,2])) )
+
+
+obs <- list(size = list(Consistent = data.frame(Tolerant = vcount(Subgroups.List$Network$module.size$Consistent$Tolerant$constrained.subnet),
+                                                Intolerant = vcount(Subgroups.List$Network$module.size$Consistent$Intolerant$constrained.subnet) ),
+                        Inconsistent = data.frame(TvivoIvitro = vcount(Subgroups.List$Network$module.size$Inconsistent$TvivoIvitro$constrained.subnet),
+                                                IvivoTvitro = vcount(Subgroups.List$Network$module.size$Inconsistent$IvivoTvitro$constrained.subnet)) )  ,
+
+            connectivity = list(Consistent = data.frame(Tolerant = ecount(Subgroups.List$Network$module.size$Consistent$Tolerant$constrained.subnet),
+                                                               Intolerant = ecount(Subgroups.List$Network$module.size$Consistent$Intolerant$constrained.subnet) ),
+                      Inconsistent = data.frame(TvivoIvitro = ecount(Subgroups.List$Network$module.size$Inconsistent$TvivoIvitro$constrained.subnet),
+                                                IvivoTvitro = ecount(Subgroups.List$Network$module.size$Inconsistent$IvivoTvitro$constrained.subnet)) ))
+
+subgroups_network_z <- data.frame(
+  module.size = c(
+      Tolerant =  (obs$size$Consistent$Tolerant - mean(rnd$size$Consistent$Tolerant))/sd(rnd$size$Consistent$Tolerant),
+      Intolerant = (obs$size$Consistent$Intolerant - mean(rnd$size$Consistent$Intolerant))/sd(rnd$size$Consistent$Intolerant),
+      TvivoIvitro = (obs$size$Inconsistent$TvivoIvitro - mean(rnd$size$Inconsistent$TvivoIvitro))/sd(rnd$size$Inconsistent$TvivoIvitro),
+      IvivoTvitro = (obs$size$Inconsistent$IvivoTvitro - mean(rnd$size$Inconsistent$IvivoTvitro))/sd(rnd$size$Inconsistent$IvivoTvitro)),
+  module.connectivity =  c(
+      Tolerant =  (obs$connectivity$Consistent$Tolerant - mean(rnd$connectivity$Consistent$Tolerant))/ sd(rnd$connectivity$Consistent$Tolerant),
+      Intolerant = (obs$connectivity$Consistent$Intolerant - mean(rnd$connectivity$Consistent$Intolerant))/ sd(rnd$connectivity$Consistent$Intolerant),
+      TvivoIvitro = (obs$connectivity$Inconsistent$TvivoIvitro - mean(rnd$connectivity$Inconsistent$TvivoIvitro))/ sd(rnd$connectivity$Inconsistent$TvivoIvitro),
+      IvivoTvitro = (obs$connectivity$Inconsistent$IvivoTvitro - mean(rnd$connectivity$Inconsistent$IvivoTvitro))/ sd(rnd$connectivity$Inconsistent$IvivoTvitro)) )
+```
+
+
+#### Enrichment (KNET)
+```{r subgroups knet, eval=F, include=F}
+subgroups.Knet.enrichment <- list(Consistent = lapply (Global.list$Subgroups$Consistent, Essentiality.Knet.categorical),
+                                  Inconsistent = lapply (Global.list$Subgroups$Inconsistent, Essentiality.Knet.categorical))
+Subgroups.List$Network$KNET <- subgroups.Knet.enrichment
+### Z-score
+subgroups_network_z$KNET <- c(
+  sapply(subgroups.Knet.enrichment$Consistent, function(i) (i$AUK.obs-mean(i$AUK.perm))/sd(i$AUK.perm)),
+  sapply(subgroups.Knet.enrichment$Inconsistent,  function(i) (i$AUK.obs-mean(i$AUK.perm))/sd(i$AUK.perm)))
+```
+
+#### Intramodular distance
+
+```{r, eval=F, include=F}
+Subgroups.distance <- list (Consistent = lapply(Global.list$Subgroups$Consistent, function(i) Test.distance(Network, i, 1000)),
+                          Inconsistent =  lapply(Global.list$Subgroups$Inconsistent, function(i) Test.distance(Network, i, 1000)))
+Subgroups.List$Network$distance <- Subgroups.distance
+
+### Z scores ####
+Subgroups.List$Network$zscore$min_dist = c(
+  sapply(Subgroups.List$Network$distance$Consistent, function(i) (i$obs.ds-mean(i$e.distances.list[,1]))/sd(i$e.distances.list[,1])),
+  sapply(Subgroups.List$Network$distance$Inconsistent, function(i) (i$obs.ds-mean(i$e.distances.list[,1]))/sd(i$e.distances.list[,1])))
+
+Subgroups.List$Network$zscore$mean_dist=c(
+  sapply(Subgroups.List$Network$distance$Consistent, function(i) (i$obs.dsm-mean(i$e.distances.list[,2]))/sd(i$e.distances.list[,2])),
+  sapply(Subgroups.List$Network$distance$Inconsistent, function(i) (i$obs.dsm-mean(i$e.distances.list[,2]))/sd(i$e.distances.list[,2])))
+
+```
+#### Perturbations
+```{r Subgroups perturbation, eval=FALSE, include=F}
+subgroups.perturbed.net <- data.frame(
+  size= c(sapply(Global.list$Subgroups$Consistent, function(i) vcount(Get.Giant.Component(delete.vertices(Network, i)))/vcount(Network)),
+          sapply(Global.list$Subgroups$Inconsistent, function(i) vcount(Get.Giant.Component(delete.vertices(Network, i)))/vcount(Network))),
+  connect = c(sapply(Global.list$Subgroups$Consistent, function(i) ecount(Get.Giant.Component(delete.vertices(Network, i)))/ecount(Network)),
+              sapply(Global.list$Subgroups$Inconsistent, function(i) ecount(Get.Giant.Component(delete.vertices(Network, i)))/ecount(Network))) )
+
+lengths <- c(sapply(Global.list$Subgroups$Consistent, length), sapply(Global.list$Subgroups$Inconsistent, length))
+
+vnet <- vcount(Network)
+enet <- ecount(Network)
+
+random.exp <- lapply(lengths, function(len) apply(t(sapply(1:1000, function(j){
+      net = Get.Giant.Component(delete.vertices(Network, sample(1:vnet,len)))
+      c(size = vcount(net)/vnet, connect = ecount(net)/enet)
+    })), 2, function(i) c(mean=mean(i), sd=sd(i))))
+#######################################################
+Subgroups.List$Network$perturbations$observed <- subgroups.perturbed.net
+# Subgroups.List$Network$perturbations$random <- random.exp
+
+subgroups_network_z$perturbed.size=c(
+    Tolerant = (Subgroups.List$Network$perturbations$observed["Tolerant","size"]-Subgroups.List$Network$perturbations$random$Tolerant["mean","size"])/Subgroups.List$Network$perturbations$random$Tolerant["sd","size"],
+    Intolerant = (Subgroups.List$Network$perturbations$observed["Intolerant","size"]-Subgroups.List$Network$perturbations$random$Intolerant["mean","size"])/Subgroups.List$Network$perturbations$random$Intolerant["sd","size"],
+    TvivoIvitro = (Subgroups.List$Network$perturbations$observed["TvivoIvitro","size"]-Subgroups.List$Network$perturbations$random$TvivoIvitro["mean","size"])/Subgroups.List$Network$perturbations$random$TvivoIvitro["sd","size"],
+    IvivoTvitro = (Subgroups.List$Network$perturbations$observed["IvivoTvitro","size"]-Subgroups.List$Network$perturbations$random$IvivoTvitro["mean","size"])/Subgroups.List$Network$perturbations$random$IvivoTvitro["sd","size"])
+
+subgroups_network_z$perturbed.connect= c(
+    Tolerant = (Subgroups.List$Network$perturbations$observed["Tolerant","connect"]-Subgroups.List$Network$perturbations$random$Tolerant["mean","connect"])/Subgroups.List$Network$perturbations$random$Tolerant["sd","connect"],
+    Intolerant = (Subgroups.List$Network$perturbations$observed["Intolerant","connect"]-Subgroups.List$Network$perturbations$random$Intolerant["mean","connect"])/Subgroups.List$Network$perturbations$random$Intolerant["sd","connect"],
+    TvivoIvitro = (Subgroups.List$Network$perturbations$observed["TvivoIvitro","connect"]-Subgroups.List$Network$perturbations$random$TvivoIvitro["mean","connect"])/Subgroups.List$Network$perturbations$random$TvivoIvitro["sd","connect"],
+    IvivoTvitro = (Subgroups.List$Network$perturbations$observed["IvivoTvitro","connect"]-Subgroups.List$Network$perturbations$random$IvivoTvitro["mean","connect"])/Subgroups.List$Network$perturbations$random$IvivoTvitro["sd","connect"])
+
+
+```
+
+#### Centrality
+```{r subgroups centrality, eval=F, include=F}
+subgroups.centrality <- list(
+  Tolerant = Global.list$Figure3$Centrality[rownames(Global.list$Figure3$Centrality) %in% Global.list$Subgroups$Consistent$Tolerant,],
+  Intolerant = Global.list$Figure3$Centrality[rownames(Global.list$Figure3$Centrality) %in% Global.list$Subgroups$Consistent$Intolerant,],
+  TvivoIvitro = Global.list$Figure3$Centrality[rownames(Global.list$Figure3$Centrality) %in% Global.list$Subgroups$Inconsistent$TvivoIvitro,],
+  IvivoTvitro = Global.list$Figure3$Centrality[rownames(Global.list$Figure3$Centrality) %in% Global.list$Subgroups$Inconsistent$IvivoTvitro,])
+
+gene.length <- c(sapply(Global.list$Subgroups$Consistent, length), sapply(Global.list$Subgroups$Inconsistent, length))
+
+Random.centrality <- lapply(lapply(gene.length, function(i)
+  lapply(1:10000, function(j)
+  Global.list$Figure3$Centrality [sample(1:nrow(Global.list$Figure3$Centrality), i),c("degree","betweenness")])), function(i) t(sapply(i, colMeans)))
+###################################################################
+Subgroups.List$Network$Centrality$Observed <- subgroups.centrality
+Subgroups.List$Network$Centrality$Random <- Random.centrality
+
+Obs.means <- list(degree = lapply(Subgroups.List$Network$Centrality$Observed, function(j) mean(j$degree)),
+                  betweenness = lapply(Subgroups.List$Network$Centrality$Observed, function(j) mean(j$betweenness)))
+
+#### z-scores ####
+subgroups_network_z$degree <- c(
+    Tolerant = (Obs.means$degree$Tolerant - mean(Subgroups.List$Network$Centrality$Random$Tolerant[,"degree"]))/sd(Subgroups.List$Network$Centrality$Random$Tolerant[,"degree"]),
+    Intolerant = (Obs.means$degree$Intolerant - mean(Subgroups.List$Network$Centrality$Random$Intolerant[,"degree"]))/ sd(Subgroups.List$Network$Centrality$Random$Intolerant[,"degree"]),
+    TvivoIvitro  = (Obs.means$degree$TvivoIvitro - mean(Subgroups.List$Network$Centrality$Random$TvivoIvitro[,"degree"])) /sd(Subgroups.List$Network$Centrality$Random$TvivoIvitro[,"degree"]),
+    IvivoTvitro  = (Obs.means$degree$IvivoTvitro - mean(Subgroups.List$Network$Centrality$Random$IvivoTvitro[,"degree"]))/sd(Subgroups.List$Network$Centrality$Random$IvivoTvitro[,"degree"]))
+
+subgroups_network_z$betweenness <- c(
+    Tolerant = (Obs.means$betweenness$Tolerant - mean(Subgroups.List$Network$Centrality$Random$Tolerant[,"betweenness"]))/sd(Subgroups.List$Network$Centrality$Random$Tolerant[,"betweenness"]),
+    Intolerant = (Obs.means$betweenness$Intolerant - mean(Subgroups.List$Network$Centrality$Random$Intolerant[,"betweenness"]))/ sd(Subgroups.List$Network$Centrality$Random$Intolerant[,"betweenness"]),
+    TvivoIvitro  = (Obs.means$betweenness$TvivoIvitro - mean(Subgroups.List$Network$Centrality$Random$TvivoIvitro[,"betweenness"])) /sd(Subgroups.List$Network$Centrality$Random$TvivoIvitro[,"betweenness"]),
+    IvivoTvitro  = (Obs.means$betweenness$IvivoTvitro - mean(Subgroups.List$Network$Centrality$Random$IvivoTvitro[,"betweenness"]))/sd(Subgroups.List$Network$Centrality$Random$IvivoTvitro[,"betweenness"]))
+
+Subgroups.List$Network$zscore <- subgroups_network_z
+```
+
+
+### Functional molecular properties
+#### Functional properties
+```{r subgroups functional properties, eval=F, include=F}
+subgroups.annotations <- list(
+  Consistent = lapply(Global.list$Subgroups$Consistent, function(i) Annotation.df[Annotation.df$symbol%in%i, 21:24]),
+  Inconsistent = lapply(Global.list$Subgroups$Inconsistent, function(i) Annotation.df[Annotation.df$symbol%in%i, 21:24]))
+
+sizes <- c(sapply(Global.list$Subgroups$Consistent, length),sapply(Global.list$Subgroups$Inconsistent, length))
+
+random.annotation <-lapply(sizes, function(size) t(sapply(colnames(Annotation.df)[21:24],
+         function(feature) {
+           tmp <-sapply(1:1000, function(i) mean(sample(Annotation.df[,feature],size),na.rm=T))
+           c(mean=mean(tmp), sd=sd(tmp))
+         })))
+
+annotation.z.score <- t(data.frame(
+  Tolerant = (colMeans(subgroups.annotations$Consistent$Tolerant, na.rm = T) - random.annotation$Tolerant[,"mean"])/random.annotation$Tolerant[,"sd"],
+  Intolerant = (colMeans(subgroups.annotations$Consistent$Intolerant, na.rm = T) - random.annotation$Intolerant[,"mean"])/random.annotation$Intolerant[,"sd"],
+  TvivoIvitro = (colMeans(subgroups.annotations$Inconsistent$TvivoIvitro, na.rm = T) - random.annotation$TvivoIvitro[,"mean"])/random.annotation$TvivoIvitro[,"sd"],
+  IvivoTvitro = (colMeans(subgroups.annotations$Inconsistent$IvivoTvitro, na.rm = T) - random.annotation$IvivoTvitro[,"mean"])/random.annotation$IvivoTvitro[,"sd"] ))
+
+Subgroups.List$Functional$Mol.properties$observed <- subgroups.annotations
+Subgroups.List$Functional$Mol.properties$random <- random.annotation
+Subgroups.List$Functional$Mol.properties$zscore <- annotation.z.score
+```
+
+
+#### Protein Classes
+
+Proteins are classified in TF, Transporters, Receptors {G-protein coupled receptors, Nuclear receptors}, Enzymes, Peptidase, Kinase, Cancer-related, RNA binding protein (RBP). The classification is taken from The human protein atlas, adding TFs from [Lambert, 2018] and RBAs from
+[Gertsberger,2014], Trasporters and receptors where added from [Southan et al 2014 IUPHAR].
+
+```{r groups protein class, eval=F, include=F}
+Subgroups.List$Functional$protein_class$observed <- c(
+  lapply(Global.list$Subgroups$Consistent, function(i) protein.class[protein.class$Gene%in%i, 3:11]),
+  lapply(Global.list$Subgroups$Inconsistent, function(i) protein.class[protein.class$Gene%in%i, 3:11]) )
+
+Subgroups.List$Functional$protein_class$observed_sum <-sapply(Subgroups.List$Functional$protein_class$observed, colSums)
+
+sizes <- c(sapply(Global.list$Subgroups$Consistent, length),sapply(Global.list$Subgroups$Inconsistent, length))
+
+random_classes <- lapply(sizes,function(s) t(sapply(1:10000, function(i) colSums(protein.class[sample(1:nrow(protein.class), s), 3:11]))))
+
+Subgroups.List$Functional$protein_class$random <- random_classes
+
+expected <- lapply(random_classes, apply,2,function(i) c(mean=mean(i), sd =sd(i)))
+obs <- Subgroups.List$Functional$protein_class$observed_sum
+zscore <- sapply(names(expected), function(i) (obs[,i]-expected[[i]]["mean",])/expected[[i]]["sd",])
+
+Subgroups.List$Functional$protein_class$zscore <- zscore
+```
+#### DAVID functional cluster enrichment
+
+```{r, echo=F}
+#### Subgroups genes enrichment DAVID ####
+enriched <- c(lapply(Global.list$Subgroups$Consistent, function(i) Annotated.Ensembl.gene.annotation.GRCh38.GRanges$ensembl[Annotated.Ensembl.gene.annotation.GRCh38.GRanges$symbol%in%i]),
+              lapply(Global.list$Subgroups$Inconsistent, function(i) Annotated.Ensembl.gene.annotation.GRCh38.GRanges$ensembl[Annotated.Ensembl.gene.annotation.GRCh38.GRanges$symbol%in%i]))
+
+DAVID_subgroups <- lapply(enriched, function(i) GetDAVIDTopClusters(genes =i) )
+Subgroups.List$Functional$DAVIDclusters <- DAVID_subgroups
+```
+
+#### SubgroupsConservation index
+
+```{r subgroups number of orthologs}
+tmp <- Global.list$Figure7$orthologs_matrix
+classification <- Global.list$Figure7$Classification
+##### Order columns by taxonomic kingdom ####
+tmp2 <- data.frame(K=classification$kingdom ,t(tmp))
+colnames(tmp2)[-1][(rownames(tmp)!=colnames(tmp2)[-1])] <- gsub( ".", "-",colnames(tmp2)[-1][(rownames(tmp)!=colnames(tmp2)[-1])], fixed = T) ## correct colnames changed in t()
+tmp2$K <- factor(tmp2$K, levels=c("Archaea", "Bacteria","Protozoa", "Fungi","Plantae","Animalia"))
+tmp2 <- tmp2[order(tmp2$K),]
+
+Animals <- tmp2[tmp2["K"]=="Animalia",-1]
+animals <- classification[match(rownames(Animals), classification$in_matrix), c("in_matrix","phylum","class")]
+Animals <- data.frame(animals[match(rownames(Animals), animals$in_matrix), c("phylum","class")], Animals )
+
+tmp3 <- cbind(Archaea_21sp = apply(tmp2[tmp2["K"]=="Archaea",-1], 2, max),
+              Bacteria_99sp = apply(tmp2[tmp2["K"]=="Bacteria",-1], 2, max),
+              Protozoa_16sp = apply(tmp2[tmp2["K"]=="Protozoa",-1], 2, max),
+              Fungi_8sp = apply(tmp2[tmp2["K"]=="Fungi",-1], 2, max),
+              Plants_9sp = apply(tmp2[tmp2["K"]=="Plantae",-1], 2, max),
+              Invertebrates_24sp = apply(Animals[Animals$phylum!="Chordata",-c(1:2)], 2, max),
+              Vertebrates_10sp = apply(Animals[Animals$phylum=="Chordata",-c(1:2)], 2, max)) ## gene presence per taxa (# of appearances/#of species)
+
+tmp <- lapply(Global.list$Subgroups, lapply, function(i) tmp3[rownames(tmp3)%in%i,])
+obs <- lapply (tmp, sapply, function(m) colSums(m)*100/nrow(m))
+Subgroups.List$Conservation$genes.phyla <- tmp
+Subgroups.List$Conservation$observed <- obs
+########### Z-score #####
+ortho <- data.frame(K=classification$kingdom ,t(human.to.all.ortho.binary.matrix))
+
+Animals <- ortho[ortho["K"]=="Animalia",-1]
+animals <- classification[match(rownames(Animals), classification$in_matrix), c("in_matrix","phylum","class")]
+Animals <- data.frame(animals[match(rownames(Animals), animals$in_matrix), c("phylum","class")], Animals )
+
+tmp_rnd <- cbind(Archaea_21sp = apply(ortho[ortho["K"]=="Archaea",-1],2,max),
+              Bacteria_99sp = apply(ortho[ortho["K"]=="Bacteria",-1],2,max),
+              Protozoa_16sp = apply(ortho[ortho["K"]=="Protozoa",-1],2,max),
+              Fungi_8sp = apply(ortho[ortho["K"]=="Fungi",-1],2,max),
+              Plants_9sp = apply(ortho[ortho["K"]=="Plantae",-1],2,max),
+              Invertebrates_24sp = apply(Animals[Animals$phylum!="Chordata",-c(1:2)],2,max),
+              Vertebrates_10sp = apply(Animals[Animals$phylum=="Chordata",-c(1:2)],2,max))
+
+sizes = lapply(tmp, sapply, nrow)
+rnd.dist <- lapply(sizes,lapply, function(i) t(sapply(1:10000, function(m) colSums(tmp_rnd[sample(1:nrow(tmp_rnd), i),])*100/i)))
+
+rnd.mean <- lapply(rnd.dist, lapply, colMeans)
+rnd.sd <- lapply(rnd.dist, lapply, apply,2,sd)
+
+z <- lapply(names(obs), function(n) sapply(colnames(obs[[n]]), function(m)  sapply(names(obs[[n]][,m]), function(p)  (obs[[n]][,m][p] -rnd.mean[[n]][[m]][p])/rnd.sd[[n]][[m]][p])))
+names(z) <- names(obs)
+
+Subgroups.List$Conservation$random <- rnd.mean
+Subgroups.List$Conservation$zscore <- z
+```
+
+Check genes exclusive for each taxon
+
+```{r Fig 7 e Number of genes exclusive in each taxon, eval=F}
+tmp <- Subgroups.List$Conservation$genes.phyla
+vert_excl <- unlist(lapply(tmp, lapply,function(m) colSums(m[rowSums(m)==1,])[7])) ## check number of exclusive genes per taxa
+names(vert_excl) <- sapply(strsplit(names(vert_excl),"[.]"),"[",2)
+
+n = lapply(tmp, sapply,nrow)
+
+rnd <- lapply(n, function(j) sapply(j, function(i) 
+  sapply(1:10000, function(k) {
+    m = tmp3[sample(1:nrow(tmp3), i),]
+    x = colSums(m[rowSums(m)==1,])[7]
+    })))
+rnd <- cbind(rnd[[1]],rnd[[2]])
+mean_rnd <- colMeans(rnd)
+sd_rnd <- apply(rnd, 2, sd)
+
+z <- (vert_excl - mean_rnd)/sd_rnd
+
+rnd_percent <- mean(mean_rnd/unlist(lapply(tmp,sapply,nrow)))
+
+df <- data.frame(group = factor(names(vert_excl), levels=c("Tolerant", "TvivoIvitro","IvivoTvitro","Intolerant")), 
+                 value = vert_excl/unlist(lapply(tmp,sapply,nrow)), 
+                 pval = convert.z.score(z), 
+                 signif = symnum(convert.z.score(z),corr = F, na=F, cutpoints=c(0,.0001,.001,.05,1), symbols = c("***", "**", "*", "")))
+
+ggbarplot(df, x="group", y="value",color="group",fill="group", alpha=0.7, label=df$signif)+
+  geom_hline(yintercept = rnd_percent, linetype="dashed")+
+  scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1], "TvivoIvitro"=ccols[5],"IvivoTvitro"=ccols[6]))+
+  scale_fill_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1], "TvivoIvitro"=ccols[5],"IvivoTvitro"=ccols[6]))+
+  ylab("% genes exclusive of Vertebrates") + xlab("") + theme(legend.pos = "", axis.text.x = element_blank())
+```
+
+
+
+#### OGEE subgroups Dev. genes
+```{r Fig 7 f subgroups dev genes}
+x <- data.frame( table(Global.list$OGEE$data$devgenes$GOTerm))
+x <- x[x$Freq>150,]
+
+tmp <- Global.list$OGEE$data$devgenes[Global.list$OGEE$data$devgenes$GOTerm%in%x$Var1,c("symbol","GOTerm")]
+tmp$GOTerm <- factor(as.character(tmp$GOTerm))
+
+Obs_dev_genes <- lapply(Global.list$Subgroups, lapply, function(i) tmp$GOTerm[tmp$symbol %in% i])
+Obs_count <- lapply(Obs_dev_genes, sapply, table)
+Obs_count <- cbind(Obs_count[[1]], Obs_count[[2]])
+
+n =unlist( lapply(Global.list$Subgroups, sapply,length))
+
+rnd <- lapply(n, function(j) sapply(1:10000, function(k) 
+    table(tmp$GOTerm[tmp$symbol %in% sample( Annotated.Ensembl.gene.annotation.GRCh38.GRanges$symbol, j)])))
+
+names(rnd) <- sapply(strsplit(names(rnd),"[.]"),"[",2)
+mean_rnd <- sapply(rnd, rowMeans)
+sd_rnd <- sapply(rnd, apply, 1, sd)
+
+z_score <- sapply(colnames(Obs_count), function(i) (Obs_count[,i]-mean_rnd[,i])/sd_rnd[,i] )
+
+
+df <- cbind(melt(t(t(Obs_count)/n)), z= melt(z_score)$value) 
+df$pval <- convert.z.score(df$z)
+df$signif = symnum(df$pval,corr = F, na=F, cutpoints=c(0,.0001,.001,.05,1), symbols = c("***", "**", "*", ""))
+
+exp= data.frame(Var1=names(rowMeans(t(t(mean_rnd)/n))), value=rowMeans(t(t(mean_rnd)/n)))
+
+df$Var2 <- factor(df$Var2, levels=c("Tolerant", "TvivoIvitro","IvivoTvitro","Intolerant"))
+df$Var1 <- factor(df$Var1, levels=df$Var1[df$Var2=="IvivoTvitro"][order(df$z[df$Var2=="IvivoTvitro"])])
+
+p1 <- ggbarplot(df, x="Var1", y="z", label="signif", color="Var2", position = position_dodge(.8), alpha=0.7 , fill="Var2") +
+  geom_hline(yintercept = 0, linetype="dashed")+
+  theme(legend.position = "",axis.text.x = element_text(size=8,angle=45, hjust=1))+ xlab("")+ylab("z score")+
+  scale_fill_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1], "TvivoIvitro"=ccols[5],"IvivoTvitro"=ccols[6]))+
+  scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1], "TvivoIvitro"=ccols[5],"IvivoTvitro"=ccols[6]))
+
+df$Var1 <- factor(df$Var1, levels=df$Var1[df$Var2=="IvivoTvitro"][order(df$value[df$Var2=="IvivoTvitro"])])
+  
+p2 <- ggscatter(df, x="Var1", y="value", label="signif", color="Var2", fill="Var2", alpha=0.7, size=3 )+ 
+  geom_line(aes(group=Var2, color=Var2)) +
+   scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+   geom_point(data=exp, color=1, shape="-", size=10)+
+   theme(legend.position = "",axis.text.x = element_text(size=8,angle=45, hjust=1))+ xlab("")+ylab("% genes")+
+   scale_fill_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1], "TvivoIvitro"=ccols[5],"IvivoTvitro"=ccols[6]))+
+   scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1], "TvivoIvitro"=ccols[5],"IvivoTvitro"=ccols[6]))
+
+p1;p2
+```
+
+#### Subgroups tissue specific expression
+```{r fig 7 g }
+tmp <- Global.list$Tissue_enrichment$GTEx_enrich_mat
+
+GTEx_enrich_subgroups <- lapply(Global.list$Subgroups, lapply, function(i) tmp[rownames(tmp)%in%i, ] )
+
+group.sizes <- unlist(lapply(Global.list$Subgroups, sapply, length))
+random_enrich <- lapply(group.sizes, function(i) t(sapply(1:10000, function(j) apply(tmp[sample(1:nrow(tmp), i), ],2,mean))) )
+
+expected_mean <- sapply(random_enrich, function(i) apply(i,2,mean))
+expected_sd <- sapply(random_enrich, function(i) apply(i,2,sd))
+obs_mean <- lapply(GTEx_enrich_subgroups, sapply, function(i) apply(i,2,mean))
+
+enrichment_z_score <- data.frame(
+  Tolerant= (obs_mean$Consistent[,"Tolerant"]-expected_mean[,"Consistent.Tolerant"])/expected_sd[,"Consistent.Tolerant"],
+  Intolerant= (obs_mean$Consistent[,"Intolerant"]-expected_mean[,"Consistent.Intolerant"])/expected_sd[,"Consistent.Intolerant"],
+  TvivoIvitro= (obs_mean$Inconsistent[,"TvivoIvitro"]-expected_mean[,"Inconsistent.TvivoIvitro"])/expected_sd[,"Inconsistent.TvivoIvitro"],
+  IvivoTvitro= (obs_mean$Inconsistent[,"IvivoTvitro"]-expected_mean[,"Inconsistent.IvivoTvitro"])/expected_sd[,"Inconsistent.IvivoTvitro"] )
+
+
+brain.tissues <- c("Brodmann..1909..area.24", "Brodmann..1909..area.9", "amygdala","cerebral.cortex", "hippocampus.proper",  "putamen", "nucleus.accumbens", "cerebellar.hemisphere","substantia.nigra","caudate.nucleus",  "cerebellum", "hypothalamus")
+
+Heatmap(enrichment_z_score[brain.tissues,], show_row_dend = F,col = colorRamp2(c(-10,0,10), c("blue", "white", "red")),
+        show_column_dend = F)
+```
+
+### Figure 7 Subgroups 
+```{r Fig 7 c Protein classes subgroups , echo=F}
+tmp <- melt(Subgroups.List$Functional$protein_class$zscore)
+tmp$Var2 <- factor(tmp$Var2, levels=c("Tolerant", "TvivoIvitro","IvivoTvitro","Intolerant"))
+tmp$pval <- convert.z.score(tmp$value)
+tmp$signif <- symnum(tmp$pval,corr = F, na=F, cutpoints=c(0,.0001,.001,.05,1), symbols = c("***", "**", "*", "n.s."))
+tmp$Var1 <- factor(tmp$Var1,levels= c("TF", "Receptors", "Cancer", "Kinase"))
+tmp <- tmp[!is.na(tmp$Var1),]
+
+ggbarplot(tmp, x="Var1", y="value", fill = "Var2", width=.8,col="Var2", position = position_dodge(.8), alpha=0.7, 
+          label = tmp$signif, lab.vjust = .5)+
+  scale_fill_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1], "TvivoIvitro"=ccols[5],"IvivoTvitro"=ccols[6]))+
+  scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1], "TvivoIvitro"=ccols[5],"IvivoTvitro"=ccols[6]))+
+  ylab("z score")+xlab("")+ geom_hline(yintercept = 0,linetype="dashed")+ geom_vline(xintercept = (1:8)+.5, col="gray", linetype="dotted")+
+  theme(legend.position =  "", axis.text.x = element_text(size=8, angle = 90, vjust=.5, hjust=1))
+```
+
+```{r Fig 7 b David clusters, echo=F}
+##### David clusters####
+tmp <- lapply(Subgroups.List$Functional$DAVIDclusters,function(j) t(sapply(j, function(i) cbind(Score=i$Score, Term=i$Term[1], Term2=i$Term[2]) )) )
+tmp <- lapply(tmp,as.data.frame)
+lng <- melt(tmp)
+lng$V1 <- as.numeric(as.character(lng$V1))
+
+p2 <- ggbarplot(lng, x="V2",y="V1", fill="L1", color="L1",
+          sort.val = "asc", position = position_dodge(), alpha=0.6,
+          facet.by = "L1",  scales="free_y",
+          lab.size = 3, lab.pos = "in", lab.vjust = 0)+ 
+  theme(legend.position = "", axis.text.y=element_blank(),axis.ticks.y=element_blank(), axis.text.x=element_text(size=8), axis.title = element_text(size=10)) + 
+  scale_fill_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1], "TvivoIvitro"=ccols[5],"IvivoTvitro"=ccols[6]))+
+  scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1], "TvivoIvitro"=ccols[5],"IvivoTvitro"=ccols[6]))+
+  ylab("Enrichment Score")+xlab("")+coord_flip()
+
+p2
+```
+
+```{r Fig 7 d subgroups cons, echo=F}
+x <- cbind(Subgroups.List$Conservation$observed[[1]],
+           Subgroups.List$Conservation$observed[[2]],
+           Subgroups.List$Conservation$random$Consistent$Intolerant)
+x <- x[,c(1,3,4,2,5)]
+
+x <- round(x,0)
+h1 <- Heatmap(x[,1], cluster_rows = F, cluster_columns = F,
+        col = colorRamp2(c(0,  100), c("white",ccols[2])),
+        row_names_side = "left", show_column_names = F, show_heatmap_legend = F)
+
+h2 <- Heatmap(x[,2], cluster_rows = F, cluster_columns = F,
+        col = colorRamp2(c(0,  100), c("white",ccols[5])), 
+        show_row_names = FALSE, show_column_names = F, show_heatmap_legend = F)
+
+h3 <- Heatmap(x[,3], cluster_rows = F, cluster_columns = F,
+        col = colorRamp2(c(0,  100), c("white",ccols[6])), 
+        show_row_names = FALSE, show_column_names = F, show_heatmap_legend = F)
+
+h4 <- Heatmap(x[,4], cluster_rows = F, cluster_columns = F,
+        col = colorRamp2(c(0,  100), c("white",ccols[1])),
+        show_row_names = FALSE, show_column_names = F, show_heatmap_legend = F)
+
+h5 <- Heatmap(x[,5], cluster_rows = F, cluster_columns = F,
+        col = colorRamp2(c(0,  100), c("white","black")),
+        show_row_names = FALSE, show_column_names = F, show_heatmap_legend = F)
+h1+h2+h3+h4+h5
+```
+
+## Result 8: Association with brain diseases
+### Disease GSEA
+```{r}
+s = intersect(names(Global.list$mean.ranks$in_vivo),names(Global.list$mean.ranks$in_vitro))
+rank_diff = data.frame(rank_diff = Global.list$mean.ranks$in_vivo[s] - Global.list$mean.ranks$in_vitro[s]) %>%
+  arrange(-rank_diff)
+```
+
+
+```{r}
+GWAS$Associations <- GWAS$Associations %>% lapply(function(i) i[i%in%rownames(rank_diff)])
+
+GWAS$Matrix = GWAS$Matrix %>% as.matrix %>% as.data.frame %>%
+    filter(rownames(.) %in% rownames(rank_diff))%>%
+  rbind(matrix(0,nrow = sum(!(rownames(rank_diff)%in%rownames(GWAS$Matrix))), ncol=ncol(GWAS$Matrix)) %>%
+          data.frame %>% set_rownames(rownames(rank_diff)[!(rownames(rank_diff)%in%rownames(GWAS$Matrix))]) %>%
+          set_colnames(colnames(GWAS$Matrix))) 
+```
+
+#### Gene sets overlap enrichment subgroups with neuronal 
+```{r}
+supertests = lapply(names(GWAS$Associations), function(dis){
+  test <-  c(GWAS$Associations[dis], 
+           Global.list$Subgroups$Consistent,
+           Global.list$Subgroups$Inconsistent)
+  return(supertest(test, n = nrow(rank_diff), degree=2)) }) %>%
+  set_names(names(GWAS$Associations))
+```
+
+```{r}
+table <- lapply(names(supertests), function(i)  summary(supertests[[i]])$Table %>%
+  mutate(first = strsplit(.$Intersections,' & ') %>% sapply('[',1) ,
+         set = strsplit(.$Intersections,' & ') %>% sapply('[',2) ,
+         plog=-(log10(.$P.value)),
+         signif=signifStars(.$P.value) ) %>%
+   filter(Degree==2, first == i) %>% 
+  dplyr::select(set,Observed.Overlap, Expected.Overlap, P.value, FE, signif) %>%
+    mutate(disease=i)) %>% do.call('rbind', .)
+table$type <- 'Psychiatric/cognitive'
+table$type[table$disease=='cancer'|table$disease=='T2D'] = 'Other'
+table$type[table$disease=='AD'|table$disease=='ALS'|table$disease=='autism'|table$disease=='PD'] = 'Neurodegenerative'
+```
+
+
+```{r Fig. 8 a}
+table %>% filter(disease!='autism',disease!='body height',disease!='BMI') %>%
+  mutate(set=factor(.$set, levels=c('TvivoIvitro','Intolerant','Tolerant','IvivoTvitro'))) %>%
+  ggbarplot(x='disease',y='FE', fill='type', 
+            order = c('cancer','T2D','AD','ALS','PD','schizophrenia', 'depression','cognition','intelligence ','BD'),
+            label=.$signif,lab.size = 4, lab.vjust = .1, position = position_dodge(.8), xlab='') + 
+  facet_grid(.~set) +
+  theme_pubclean(base_size = 8) + geom_hline(yintercept = 1) +
+  scale_fill_manual(values=alpha(pal_nejm()(3)[c(3,2,1)],0.8)) + 
+  scale_color_manual(values=rep(1,10)) + 
+  theme(axis.text.x = element_text(angle=90, vjust=0.5,hjust=1), legend.position = 'none')
+```
+#### Heatmap genes X disease
+
+```{r}
+df = GWAS$Matrix[rownames(rank_diff),] %>% mutate(rank_diff=rank_diff$rank_diff) %>%
+  dplyr::select('cancer','T2D','AD','ALS','PD','schizophrenia','depression','cognition','intelligence ','BD', rank_diff)
+```
+
+```{r}
+tmp <- read.csv('neuronal_genes_annotation.csv', header=T)
+
+tmp2 <- df %>% 
+  filter(rowSums(.[,1:10])>0) %>%
+  (function(i) rbind(head(i,15),tail(i,15)))
+tmp2 <- cbind(tmp2,tmp[match(rownames(tmp2), tmp$Gene),3:7])
+tmp2 <- tmp2 %>% mutate(t =ifelse(rank_diff>0,1,0)) %>% 
+  arrange(t, Ion.channel, Neurodevelopment,Signal.transduction, 
+           -Transcription, -Cell.cycle)
+```   
+
+```{r Fig 8 d}
+tmp2[,1:10] %>%
+  Heatmap(cluster_rows = F,col = colorRamp2(c(0,1), c('white','steelblue')), 
+          width = unit(1, 'in'), show_heatmap_legend = F, row_names_side = 'left',
+          column_names_gp = gpar(fontsize=7),row_names_gp = gpar(fontsize=7), cluster_columns = F, 
+          row_split = factor(rep(c("OI-CT", "CI-OT"),each= 15), levels=c("OI-CT", "CI-OT")), row_gap = unit(3, "mm"),
+          cell_fun = function(j, i, x, y, width, height, fill) {
+            grid.rect(x = x, y = y, width = width, height = height, 
+            gp = gpar(col = "black", fill = NA, lwd=.3))}) +
+tmp2[,12:16] %>%
+  Heatmap(cluster_rows = F,col = colorRamp2(c(0,1), c('white','darkgray')), 
+          width = unit(.6, 'in'), show_heatmap_legend = F, row_names_side = 'left',
+          column_names_gp = gpar(fontsize=7),row_names_gp = gpar(fontsize=7), cluster_columns = F,
+          cell_fun = function(j, i, x, y, width, height, fill) {
+            grid.rect(x = x, y = y, width = width, height = height, 
+            gp = gpar(col = "black", fill = NA, lwd=.3))})  +
+tmp2[,11] %>%
+  Heatmap(cluster_rows = F,name = 'rank_diff',
+          col = colorRamp2(c(-10000,0,10000), c('blue','white','red')), 
+          width = unit(.1, 'in'),
+          column_names_gp = gpar(fontsize=8),row_names_gp = gpar(fontsize=8))
+```
+
+#### GSEA cumulative sum lines
+```{r}
+p = (sapply(GWAS$Associations[c(-3,-5,-6)], length) %>% mean)/nrow(df) 
+rnd <- 
+  sapply(1:1000, function(i) sample(0:1,nrow(df),replace = T,prob=c(1-p,p))) %>% data.frame %>%
+  # mutate(rank_diff = rank_diff$rank_diff) %>% arrange(-rank_diff) %>%
+  mutate_at(1:1000, function(i) cumsum(i)/sum(i)) %>% rowMeans()
+```
+
+
+```{r Fig 8 b}
+df %>%  arrange(-rank_diff) %>%
+  mutate(random = rnd) %>% ## add random set
+  mutate_at(1:10, function(i) cumsum(i)/sum(i)) %>% 
+  melt(id.vars='rank_diff') %>% 
+  mutate(type=ifelse(variable=='cancer'|variable=='T2D', 'Non-neuronal', 'Psychiatric/cognitive')) %>%
+  (function(i){ i$type[i$variable=='AD'|i$variable=='ALS'|i$variable=='PD'] = 'Neurodegenerative'
+    i$type[i$variable=='random'] = 'Random'
+    return(i)}) %>%
+  ggplot(aes(x=rank_diff, y=value, color = type, group = variable)) +
+  geom_line(size=.5)+ theme_pubr(base_size = 8) +
+  ylab('cum.sum')+ xlab('') + 
+  theme(legend.position = 'none', legend.title = element_blank()) + 
+  scale_x_reverse() +  scale_color_manual(values=alpha(c(pal_nejm()(3)[c(3,2,1)],'gray'), 0.8))
+
+```
+
+
+```{r Fig 8 b inset}
+df %>%  arrange(-rank_diff) %>%
+  mutate(random = rnd) %>% ## add random set
+  mutate_at(1:10, function(i) cumsum(i)/sum(i)) %>% 
+  melt(id.vars='rank_diff') %>% 
+  mutate(type=ifelse(variable=='cancer'|variable=='T2D', 'Non-neuronal', 'Psychiatric/cognitive')) %>%
+  (function(i){ i$type[i$variable=='AD'|i$variable=='ALS'|i$variable=='PD'] = 'Neurodegenerative'
+    i$type[i$variable=='random'] = 'Random'
+    return(i)}) %>%
+  filter(rank_diff>7000) %>%
+  ggplot(aes(x=rank_diff, y=value, color = type, group = variable)) +
+  geom_line(size=.5)+ theme_pubr(base_size = 8) +
+  ylab('cum.sum')+ xlab('') + 
+  theme(legend.position = 'none', legend.title = element_blank()) + 
+  scale_x_reverse() +  scale_color_manual(values=alpha(c(pal_nejm()(3)[c(3,2,1)],'gray'), 0.8))
+```
+
+
+```{r Fig 8 b bottom}
+data.frame(rank_diff = round(min(df$rank_diff)):round(max(df$rank_diff))) %>%
+  Heatmap(cluster_columns = F, show_row_names = F, cluster_rows=F,
+          height = unit(3,'in'),width = unit(0.2, 'in'),
+          col = colorRamp2(c(-10000,0,10000),  c('blue','white','red')), use_raster = T, raster_quality = 5)
+rank_diff %>% arrange(rank_diff) %>%
+  mutate('in vivo' = Global.list$mean.ranks$in_vivo[rownames(.)],'in vitro'=Global.list$mean.ranks$in_vitro[rownames(.)]) %>%
+  dplyr::select(-rank_diff) %>%
+  Heatmap(cluster_columns = F, show_row_names = F, cluster_rows=F, show_heatmap_legend = F,
+          col = colorRamp2(c(0,15000),  c('white','steelblue')), width = unit(0.4, 'in'), use_raster = T, raster_quality = 5)
+
+```
+
+
+```{r}
+fgseaRes <- fgsea(pathways = GWAS$Associations[c(-3,-5,-6)], 
+                  stats    = rank_diff$rank_diff %>% set_names(rownames(rank_diff)),
+                  minSize  = 100,
+                  maxSize  = 7000)
+```
+
+```{r}
+fgseaRes_vivo <- fgsea(pathways = GWAS$Associations[c(-3,-5,-6)], 
+                  stats    = Global.list$mean.ranks$in_vivo,
+                  minSize  = 100,
+                  maxSize  = 7000)
+fgseaRes_vitro <- fgsea(pathways = GWAS$Associations[c(-3,-5,-6)], 
+                  stats    = Global.list$mean.ranks$in_vitro,
+                  minSize  = 100,
+                  maxSize  = 7000)
+
+```
+
+
+```{r Figure 8 c}
+ps =fgseaRes %>%data.frame %>%dplyr::select(pathway, padj) %>% 
+  mutate(in_vivo = fgseaRes_vivo$padj%>% signifStars(),
+         in_vitro = fgseaRes_vitro$padj %>% signifStars(),
+         diff_rank = padj%>% signifStars()) %>% set_rownames(.$pathway) %>%
+  dplyr::select(in_vitro,in_vivo,diff_rank) 
+
+fgseaRes %>% data.frame %>%dplyr::select(pathway, NES) %>% 
+  mutate(in_vivo = fgseaRes_vivo$NES,
+         in_vitro = fgseaRes_vitro$NES,
+         diff_rank = NES) %>% set_rownames(.$pathway) %>% 
+  filter(pathway!='body height',pathway!='BMI') %>%
+  dplyr::select(in_vitro,in_vivo,diff_rank) %>%
+
+  Heatmap( show_column_dend = F, cluster_rows = T, cluster_columns = F,
+           # col = colorRamp2(c(0,2),c('white','red')),
+        #    cell_fun = function(j, i, x, y, width, height, fill) {
+        # grid.text( ps[i, j], x, y, gp = gpar(fontsize = 7))},
+        width=unit(.4,'in'), height= unit(1,'in'), 
+        row_names_gp = gpar(fontsize=8), column_names_gp = gpar(fontsize=8), row_names_side = 'left', 
+        name='NES', row_dend_width = unit(.1,'in'),
+        right_annotation = rowAnnotation(type = c('Neurodegenerative','Neurodegenerative','Psychiatric/cognitive','Neurodegenerative','Non-neuronal',
+                       'Non-neuronal','Psychiatric/cognitive','Psychiatric/cognitive',
+                       'Psychiatric/cognitive','Psychiatric/cognitive')),
+        cell_fun = function(j, i, x, y, width, height, fill) {
+          grid.text( ps[i, j], x, y, gp = gpar(fontsize = 5))}) 
+```
+
+
+## Supplementary Figures
+
+### Supp. Fig 1. Topological features extended
+
+```{r Supp.Fig 1}
+ ### a) Aggregation ####  
+
+tmp <- melt(Global.list$Figure3$module_Sc_Cc$rnd)
+tmp2 <- melt(Global.list$Figure3$module_Sc_Cc$obs)
+tmp$L1 <- factor(tmp$L1, levels=c("size", "connectivity"))
+tmp2$L1 <- factor(tmp2$L1, levels=c("size", "connectivity"))
+    
+S.F.a <- ggviolin(tmp,x="L2", y="value", fill="L2",add="boxplot", color="gray", add.params=list(fill = "white"), alpha=.6, width=0.6)+
+  facet_wrap(~L1, scale="free_y")+
+  geom_point(data=tmp2, aes(x=L2,y=value, color=variable), size=3,shape=19)+ 
+  scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1])) + 
+  scale_fill_manual(values = c("in_vivo"=ccols[4],"in_vitro" = ccols[3])) + 
+  xlab("")+ylab("")+theme_pubr()+ 
+  scale_x_discrete(labels=c("in_vivo" = "OF", "in_vitro" = "CV"))+ 
+  theme(axis.text = element_text(size=8), axis.title =element_text(size=8), legend.position = "") +
+  scale_y_continuous(labels = scientific)
+
+ ### b) Distance ####  
+
+tmp <- melt(lapply(Global.list$Figure3$Distance$Tolerant, function(i) list(ds=i$e.distances.list[,"e.dsr"], dsm=i$e.distances.list[,"e.dsmr"])))
+colnames(tmp) <- c("value","L3","L2")
+
+tmp2 <- melt(list(Tolerant=lapply(Global.list$Figure3$Distance$Tolerant, function(i) list(ds=i[["obs.ds"]],dsm =i[["obs.dsm"]])),
+            Intolerant=lapply(Global.list$Figure3$Distance$Intolerant, function(i) list(ds=i[["obs.ds"]],dsm =i[["obs.dsm"]]))))
+
+S.F.b <- ggviolin(tmp,x="L2", y="value", fill="L2",add="boxplot", color="gray", add.params=list(fill = "white"), alpha=.6, width=0.6)+
+  facet_wrap(~L3, scale="free_y")+
+  geom_point(data=tmp2, aes(x=L2,y=value, color=L1), size=3,shape=19)+ 
+  scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1])) + 
+  scale_fill_manual(values = c("in_vivo"=ccols[4],"in_vitro" = ccols[3])) + 
+  xlab("")+ylab("")+ theme_pubr()+ 
+  scale_x_discrete(labels=c("in_vivo" = "OF", "in_vitro" = "CV"))+ 
+  theme(axis.text = element_text(size=8), axis.title =element_text(size=8), legend.position = "")
+
+
+### Centrality distribution ####
+Consensus.centrality <- list(
+  Tolerant = lapply(Global.list$Groups$Tolerant, function(i) 
+    Global.list$Figure3$Centrality[rownames(Global.list$Figure3$Centrality) %in% i,]), 
+  Intolerant = lapply(Global.list$Groups$Intolerant, function(i) 
+    Global.list$Figure3$Centrality[rownames(Global.list$Figure3$Centrality) %in% i,]))
+
+tmp <- melt(list(
+  All=list(
+    All=list(degree = Global.list$Figure3$Centrality$degree,
+             betweenness = Global.list$Figure3$Centrality$betweenness,
+             coreness = Global.list$Figure3$Centrality$Coreness)),
+  Tolerant=list(
+    in_vivo = list(degree = Consensus.centrality$Tolerant$in_vivo$degree,
+                 betweenness = Consensus.centrality$Tolerant$in_vivo$betweenness,
+                 coreness = Consensus.centrality$Tolerant$in_vivo$Coreness),
+    in_vitro = list(degree = Consensus.centrality$Tolerant$in_vitro$degree,
+                  betweenness = Consensus.centrality$Tolerant$in_vitro$betweenness,
+                  coreness = Consensus.centrality$Tolerant$in_vitro$Coreness)),
+  Intolerant=list(
+    in_vivo = list(degree = Consensus.centrality$Intolerant$in_vivo$degree,
+                 betweenness = Consensus.centrality$Intolerant$in_vivo$betweenness,
+                 coreness = Consensus.centrality$Intolerant$in_vivo$Coreness),
+    in_vitro = list(degree = Consensus.centrality$Intolerant$in_vitro$degree,
+                    betweenness = Consensus.centrality$Intolerant$in_vitro$betweenness,
+                    coreness = Consensus.centrality$Intolerant$in_vitro$Coreness))))
+
+S.F.c<- ggviolin(tmp, x="L2",y="value", color="L1", fill="L2", add="boxplot", width=.6, add.params=list(fill = "white"), size = 1, alpha=0.6)+  
+  facet_wrap(~L3, scale="free_y")+ scale_y_log10(labels=scientific)+xlab("")+
+  scale_x_discrete(labels=c("All"="All", "in_vivo" = "OF", "in_vitro" = "CV"))+
+  scale_color_manual(values = c("All"="gray", "Tolerant"=ccols[2],"Intolerant"=ccols[1]))+
+  scale_fill_manual(values = c("All" = "gray", "in_vivo"=ccols[4],"in_vitro" = ccols[3])) +
+  theme(axis.text = element_text(size=8), axis.title =element_text(size=8), legend.position = "")
+
+tmp <- as.data.frame(Global.list$Figure3$Coreness)
+
+p1 <- ggboxplot(tmp, x="Coreness",y="organismal", width=.5)+ylab("mean rank")+
+  theme_pubr()+  theme(axis.text = element_text(size=8), axis.title =element_text(size=10), legend.position = "",
+                       axis.text.x=element_text(color=c("black",rep("transparent",9))))
+p2 <- ggboxplot(tmp, x="Coreness",y="cellular", width=.5)+ylab("mean rank")+
+  theme_pubr()+  theme(axis.text = element_text(size=8), axis.title =element_text(size=10), legend.position = "",
+                       axis.text.x=element_text(color=c("black",rep("transparent",9))))
+
+#####
+ multiplot(S.F.a, S.F.b, cols = 1)
+S.F.c
+ multiplot(p1, p2, cols = 1)
+```
+
+```{r Sup. Fig. 1 Network Topological Features extended, echo=F, eval=F}
+### b) Module connectivity ####
+tmp <- melt(Global.list$Figure3$module_Sc_Cc$rnd)
+tmp2 <- melt(Global.list$Figure3$module_Sc_Cc$obs)
+tmp$L1 <- factor(tmp$L1, levels=c("size", "connectivity"))
+tmp2$L1 <- factor(tmp2$L1, levels=c("size", "connectivity"))
+
+S.F.1.a <- ggviolin(tmp[tmp$L1=="connectivity",],x="L2", y="value",add="boxplot", color="gray", fill="L2", alpha=0.7, add.params = list(fill="white"))+
+    geom_point(data=tmp2[tmp2$L1=="connectivity",], aes(x=L2,y=value, color=variable), size=3)+
+    scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1])) +
+    scale_fill_manual(values = c("in_vivo" = ccols[4], "in_vitro" = ccols[3])) +
+    ylab(expression("C"[c]))+xlab("")+theme_pubr()+
+    scale_x_discrete(labels=c("in_vivo" = "in vivo", "in_vitro" = "in vitro"))+
+    theme(legend.position = "", legend.title = element_blank(), axis.text = element_text(size=10), axis.title =element_text(size=10)) +
+    scale_y_continuous(labels = scientific)
+
+
+### c) SANTA curves in vivo  ####
+    S.F.1.b <- Plot.Curves.from.Knet(Global.list$Figure3$SANTA$Intolerant$in_vivo, "")+
+      geom_line(data=data.frame(X=1:9, Y=Global.list$Figure3$SANTA$Tolerant$in_vivo$K.obs),aes(x=X,y=Y), color=ccols[2], size=1)+
+      ggtitle("in vivo")+ theme_pubr()+
+      theme(plot.title = element_text(size=12), axis.text = element_text(size=10), axis.title =element_text(size=10))
+
+### d) SANTA curves in vitro  ####
+    S.F.1.c <- Plot.Curves.from.Knet(Global.list$Figure3$SANTA$Intolerant$in_vitro, "")+
+      geom_line(data=data.frame(X=1:9, Y=Global.list$Figure3$SANTA$Tolerant$in_vitro$K.obs),aes(x=X,y=Y), color=ccols[2], size=1)+
+      ggtitle("in vitro")+ theme_pubr()+
+      theme(plot.title = element_text(size=12), axis.text = element_text(size=10), axis.title =element_text(size=10))
+
+### e) SANTA area under de knet curve (AUK)  ####
+    rnd.auk <- melt(list(in_vivo = Global.list$Figure3$SANTA$Intolerant$in_vivo$AUK.perm,
+                          in_vitro = Global.list$Figure3$SANTA$Intolerant$in_vivo$AUK.perm))
+    obs.auk <- melt(list(in_vivo = lapply(Global.list$Figure3$SANTA, function(i) i$in_vivo$AUK.obs),
+                         in_vitro = lapply(Global.list$Figure3$SANTA, function(i) i$in_vitro$AUK.obs)))
+
+    S.F.1.d <- ggviolin(rnd.auk, x="L1", y="value",add="boxplot",width=.7, color="gray") +
+      geom_point(data=obs.auk, aes(x=L1,y=value, color=L2), size=3)+
+      ylab( "AUK") +xlab("")+ theme_pubr()+theme(legend.position = "")+
+      scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1]))+
+      scale_x_discrete(labels=c("in_vivo" = "in vivo", "in_vitro" = "in vitro"))+
+      theme(plot.title = element_text(size=12), axis.text = element_text(size=10), axis.title =element_text(size=10))
+
+### f) Shortest distance ####
+    tmp <- melt(list(
+      Tolerant = list(in_vivo = as.data.frame(Global.list$Figure3$Distance$Tolerant$in_vivo$e.distances.list),
+                      in_vitro = as.data.frame(Global.list$Figure3$Distance$Tolerant$in_vitro$e.distances.list)),
+      Intolerant = list(in_vivo = as.data.frame(Global.list$Figure3$Distance$Intolerant$in_vivo$e.distances.list),
+                        in_vitro = as.data.frame(Global.list$Figure3$Distance$Intolerant$in_vitro$e.distances.list))))
+
+    tmp_obs <- melt(list(
+      Tolerant = list(
+        in_vivo =data.frame(ds =Global.list$Figure3$Distance$Tolerant$in_vivo$obs.ds,
+                            dsm =  Global.list$Figure3$Distance$Tolerant$in_vivo$obs.dsm),
+        in_vitro = data.frame(ds =Global.list$Figure3$Distance$Tolerant$in_vitro$obs.ds,
+                              dsm =  Global.list$Figure3$Distance$Tolerant$in_vitro$obs.dsm)),
+      Intolerant = list(
+        in_vivo = data.frame(ds =Global.list$Figure3$Distance$Intolerant$in_vivo$obs.ds,
+                             dsm =  Global.list$Figure3$Distance$Intolerant$in_vivo$obs.dsm),
+        in_vitro = data.frame(ds =Global.list$Figure3$Distance$Intolerant$in_vitro$obs.ds,
+                              dsm =  Global.list$Figure3$Distance$Intolerant$in_vitro$obs.dsm))))
+
+    S.F.1.d <- ggviolin(tmp[tmp$variable == "e.dsr",],x="L2",y="value",color="gray",add="boxplot", width=0.8) +
+      geom_point(data = tmp_obs[tmp_obs$variable == "ds",], aes(x=L2,y=value, color=L1), size=3) +
+      theme_pubr() + scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1])) +
+      xlab("") +ylab("min. distance")+
+      scale_x_discrete(labels=c("in_vivo" = "in vivo", "in_vitro" = "in vitro"))+
+      theme(legend.position = "", plot.title = element_text(size=12), axis.text = element_text(size=10), axis.title =element_text(size=10))
+
+### g) Mean distance ####
+    S.F.1.e <- ggviolin(tmp[tmp$variable == "e.dsmr",],x="L2",y="value",color="gray", add="boxplot", width=0.8) +
+      geom_point(data = tmp_obs[tmp_obs$variable == "dsm",], aes(x=L2,y=value, color=L1), size=3)  +
+      theme_pubr()+ scale_color_manual (values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1])) +
+      xlab("") +ylab("mean distance") +
+      scale_x_discrete(labels=c("in_vivo" = "in vivo", "in_vitro" = "in vitro"))+
+      theme(legend.position = "", plot.title = element_text(size=12), axis.text = element_text(size=10), axis.title =element_text(size=10))
+### j) Betweenness centrality distribution ####
+  F.3.j <- ggviolin(tmp[tmp$L3=="betweenness",], x="L2",y="value", color="L1", fill=NA, add="boxplot", width=.8)+
+    scale_color_manual(values = c("All"="gray","Tolerant"=ccols[2],"Intolerant"=ccols[1]))+
+    stat_compare_means()+ ylab("betweenness")+scale_y_log10(labels = scientific)+xlab("")+
+    scale_x_discrete(labels=c("All"="All", "in_vivo" = "in vivo", "in_vitro" = "in vitro"))+
+    theme(legend.position = "", axis.text = element_text(size=10), axis.title =element_text(size=10))
+
+#####
+gene.length <- sapply(Global.list$Groups$Tolerant, length)
+
+Random.means <- lapply(lapply(gene.length, function(i)     lapply(1:10000, function(j) Global.list$Figure3$Centrality [sample(1:nrow(Global.list$Figure3$Centrality), i),c("degree","betweenness")])), function(i) t(sapply(i, colMeans)))
+
+Obs.means <- list(degree=lapply(Consensus.centrality, function(j) lapply(j, function(i) mean(i$degree))),
+                  betweenness=lapply(Consensus.centrality, function(j) lapply(j, function(i) mean(i$betweenness))))
+
+### i) Mean degree ####
+  tmp <- melt (Random.means)
+  tmp2 <- melt(Obs.means)
+  colnames(tmp2) <- c("value", "L1", "L2", "Var2")
+
+  F.3.i <-  ggviolin(tmp[tmp$Var2=="degree",], y="value", x="L1", color="gray",add="boxplot", width=0.8 )+
+    geom_point(data = tmp2[tmp2$Var2=="degree",], aes(x=L1,y=value,color=L2), size=3)+
+    scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1]))+
+    scale_x_discrete(labels=c("in_vivo" = "in vivo", "in_vitro" = "in vitro"))+
+    theme(legend.position = "", axis.text = element_text(size=10), axis.title =element_text(size=10))+
+    ylab("mean degree")+xlab("")+scale_y_continuous(labels = scientific)
+### k) Mean betweenness ####
+  S.F.1.f <-  ggviolin(tmp[tmp$Var2=="betweenness",], y="value", x="L1", color="gray",  width=0.8,add="boxplot" )+
+    geom_point(data = tmp2[tmp2$Var2=="betweenness",], aes(x=L1,y=value,color=L2), size=3)+
+    scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1]))+
+    scale_x_discrete(labels=c("in_vivo" = "in vivo", "in_vitro" = "in vitro"))+
+    theme(legend.position = "", axis.text = element_text(size=10), axis.title =element_text(size=10))+
+    ylab("mean betweenness")+xlab("")+scale_y_continuous(labels = scientific)
+```
+
+### Supp. Fig 2. Evolutionary patterns
+```{r a) Conservation index distribution}
+tmp <- melt(Global.list$Figure7$Conservation.Score)
+tmp$L2[is.na(tmp$L2)] <- "All"
+
+ggviolin(tmp,x="L2",y="value",color="L1", fill = "L2", alpha=.5, add="boxplot", add.params = list(fill="white", width=0.1), scale="width", width=0.7)+
+  scale_y_log10()+ 
+  scale_color_manual(values = c("All"="gray","Tolerant"=ccols[2],"Intolerant"=ccols[1]))+
+  scale_fill_manual(values = c("All"="gray","in_vivo"=ccols[4],"in_vitro"=ccols[3]))+
+  ylab("C.I.")+xlab("")+theme(legend.position = "")+ 
+  scale_x_discrete(labels=c("in_vivo" = "in vivo", "in_vitro" = "in vitro"))
+
+```
+
+```{r b) Family size distribution}
+### Family size distribution ####
+rand_distributions <- lapply(Global.list$OGEE$dupgenes$rand_dup, function(j) {
+  levs <- unique(unlist(sapply(j, names)))
+  rand_dist <- lapply(j, function(i) c(i, sapply(levs[!levs%in%names(i)],assign, value=0)) )
+  rand_dist <- sapply(rand_dist, function(i) i[order(as.numeric(names(i)))])
+  return(rowMeans(rand_dist))})
+Global.list$OGEE$dupgenes$rand_dist <- rand_distributions
+
+tmp <- Global.list$OGEE$dupgenes$obs_dup
+tmp$Expected <- lapply(Global.list$OGEE$dupgenes$rand_dist, function(x) as.numeric(rep(names(x),x)))
+
+lng <- melt(tmp)
+lng$L1 <- factor(lng$L1, levels=c("Expected", "Tolerant", "Intolerant"))
+lng$L2 <- factor(lng$L2, levels=c("in_vivo", "in_vitro"))
+
+means <- melt(lapply(tmp, lapply, mean))
+means$L2 <- factor(means$L2, levels=c("in_vivo", "in_vitro"))
+
+p2 <- ggviolin(lng, x="L1", fill="L1", color="L1", y="value", trim=T, position=position_dodge(.9), add="boxplot", add.params=list(fill="white",width=0.15), facet.by = "L2", alpha=.7)+
+  scale_y_log10()+ stat_compare_means(ref.group = "Expected", label ="p.signif", symnum.args=list(cutpoints=c(0,.0001,.001,.05,1), symbols = c("***", "**", "*", "n.s.")), size=8)+
+  scale_fill_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1], "Expected"="gray"))+
+  scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1], "Expected"="gray"))+
+  geom_point(data=means, color="black")+xlab("")+ylab("duplications")
+
+p2
+```
+
+### Supp fig 3. HPA Tissue specific expression enrichment
+
+```{r HPA tissue enrichment plots, echo=F}
+tmpz <- Global.list$Tissue_enrichment$HPA_enrich_zscore
+##### Tissues with differential expression of tolerant/intolerant genes (Rank log ratio) #### 
+rank_log_ratio <- lapply(c("in_vivo","in_vitro"), function(i) log(rank(tmpz$Intolerant[,i])/ rank(tmpz$Tolerant[,i])) )
+names(rank_log_ratio) <- c("in_vivo","in_vitro")
+
+tmp <- lapply (c("in_vivo","in_vitro"), function(i) data.frame(Intolerant=tmpz$Intolerant[,i], Tolerant=tmpz$Tolerant[,i]) )
+names(tmp) <- c("in_vivo","in_vitro")
+
+x <- data.frame(tissue=rep(paste0(rownames(tmp$in_vivo)," (", rank(-rank_log_ratio$in_vivo),")"),2),
+           z=c(tmp$in_vivo[,1], tmp$in_vivo[,2]),
+           rank_log = rep(rank_log_ratio$in_vivo,2), 
+           type=c(rep("Intolerant",32),rep("Tolerant",32)))
+
+p1 <- ggplot(x, aes(x=reorder(tissue,rank_log),y=z, color=type))+
+  geom_segment(aes( xend=reorder(tissue,rank_log), yend=0), color="gray")+
+  geom_point(size=2)+xlab("")+
+  theme_pubclean()+theme(legend.position = "",axis.text = element_text(size=7))+
+  geom_hline(yintercept =c(-1.96, 0,1.96), linetype="dashed")+
+  scale_color_manual(values = c("Tolerant"=ccols[2], "Intolerant" = ccols[1]))+
+  coord_flip()+ggtitle("in vivo")
+
+
+x <- data.frame(tissue=rep(rank(-rank_log_ratio$in_vivo),2),
+           z=c(tmp$in_vitro[,1], tmp$in_vitro[,2]),
+           rank_log = rep(rank_log_ratio$in_vitro,2), 
+           type=c(rep("Intolerant",32),rep("Tolerant",32)))
+
+p2 <- ggplot(x, aes(x=reorder(tissue,rank_log),y=z, color=type))+
+  geom_segment(aes( xend=reorder(tissue,rank_log), yend=0), color="gray")+
+  geom_point(size=2)+xlab("")+
+  theme_pubclean()+theme(axis.text = element_text(size=6), legend.position = "")+
+  geom_hline(yintercept = c(-1.96,0,1.96), linetype="dashed")+
+  scale_color_manual(values = c("Tolerant"=ccols[2], "Intolerant" = ccols[1]))+
+  coord_flip()+ggtitle("in vitro")
+
+### Rank log ratio heatmaps  
+## in vivo
+Heatmap(data.frame(rank.log.ratio = sort(rank_log_ratio$in_vivo,decreasing = T)),
+        cluster_rows = F, cluster_columns = F, show_column_names =F, show_row_names = F,
+        col = colorRamp2(c(-4,0,4), c("steelblue", "white", "darkred")), row_names_gp = gpar(fontsize = 8), 
+        show_heatmap_legend = T, column_title = "rank log ratio")
+## in vitro
+Heatmap(data.frame(rank.log.ratio = sort(rank_log_ratio$in_vitro,decreasing = T)),
+        cluster_rows = F, cluster_columns = F, show_column_names =F, show_row_names = F,
+        col = colorRamp2(c(-4,0,4), c("steelblue", "white", "darkred")), row_names_gp = gpar(fontsize = 8), 
+        show_heatmap_legend = T, column_title = "rank log ratio")
+```
+
+```{r counts per group in braintissues GTEx, echo=F}
+##### Violin plots of enrichment in brain tissues ####
+brain.tissues <- c("Brodmann..1909..area.24", "Brodmann..1909..area.9", "amygdala","cerebral.cortex", "hippocampus.proper",  "putamen", "nucleus.accumbens", "cerebellar.hemisphere","substantia.nigra","caudate.nucleus",  "cerebellum", "hypothalamus")
+
+tmp <- Global.list$Tissue_enrichment$GTEx_expr_mat[,colnames(Global.list$Tissue_enrichment$GTEx_expr_mat)%in%brain.tissues]
+
+tmp_brain <- list(Tolerant = lapply(Global.list$Groups$Tolerant, function(i) tmp[rownames(tmp)%in%i, ]),
+                  Intolerant = lapply(Global.list$Groups$Intolerant, function(i) tmp[rownames(tmp)%in%i, ]) )
+
+x <- melt(tmp_brain)
+x$Var2 <- factor(x$Var2, levels=c("Brodmann..1909..area.24", "Brodmann..1909..area.9", "amygdala","cerebral.cortex", "hippocampus.proper",  "putamen", "nucleus.accumbens", "cerebellar.hemisphere","substantia.nigra","caudate.nucleus",  "cerebellum", "hypothalamus"))
+
+p1 <- ggplot(x,aes(x=Var2,y=value,color=L1))+
+      facet_grid(~L2)+
+      geom_violin(scale="width")+
+      geom_boxplot(outlier.shape = NA, width=0.2, position = position_dodge(.9))+
+      scale_y_log10()+
+      ylab("ncounts")+xlab("")+theme_pubr()+
+      scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1]))+
+      theme(axis.text.y=element_text(size=8), axis.title.y = element_text(size=9),axis.text.x = element_text(size=8, angle=45, hjust=1),legend.position = "")
+#### Differential expression
+tmp <- Global.list$Tissue_enrichment$GTEx_enrich_mat[,colnames(Global.list$Tissue_enrichment$GTEx_enrich_mat)%in%brain.tissues]
+
+tmp_brain <- list(Tolerant = lapply(Global.list$Groups$Tolerant, function(i) tmp[rownames(tmp)%in%i, ]),
+                  Intolerant = lapply(Global.list$Groups$Intolerant, function(i) tmp[rownames(tmp)%in%i, ]) )
+
+x <- melt(tmp_brain)
+
+x$Var2 <- factor(x$Var2, levels=c("Brodmann..1909..area.24", "Brodmann..1909..area.9", "amygdala","cerebral.cortex", "hippocampus.proper",  "putamen", "nucleus.accumbens", "cerebellar.hemisphere","substantia.nigra","caudate.nucleus",  "cerebellum", "hypothalamus"))
+
+p2 <- ggviolin(x, x="Var2",y="value",color="L1", add="mean", add.params = list(group="L1", size=.3), trim=T)+
+  # scale_y_log10()+           
+  facet_grid(~L2)+
+  ylab("log2 fold change")+xlab("")+
+  geom_hline(yintercept = 0,linetype="dashed")+
+  scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1]))+
+  theme(axis.text.y=element_text(size=8), axis.title.y = element_text(size=9),axis.text.x = element_text(size=8, angle=45, hjust=1),legend.position = "")
+
+  p2
+
+enrich_vivo <- as.character(x[x$value>2 & x$L2=="in_vivo" & x$L1=="Intolerant","Var1"])
+no_tissue <- table(enrich_vivo)
+hist(no_tissue)
+all_brain_enriched <- names(no_tissue[no_tissue>6])
+
+david <- GetDAVIDTopClusters(genes =Annotated.Ensembl.gene.annotation.GRCh38.GRanges$ensembl[Annotated.Ensembl.gene.annotation.GRCh38.GRanges$symbol%in%all_brain_enriched])
+david <- as.data.frame(t(sapply(david, function(i) cbind(Score=i$Score, Term=i$Term[1], Term2=i$Term[2]) )) )
+colnames(david) <- c("Score","Term1","Term2")
+lng <- melt(david)
+lng$Score <- as.numeric(as.character(lng$Score))
+ggbarplot(lng, x="Term1",y="Score",sort.val = "asc", position = position_dodge(), alpha=0.6,
+          label = "Term1",lab.size = 4, lab.pos = "in", lab.vjust = 0, fill = ccols[6])+
+  coord_flip()+theme(axis.text.y = element_blank())+xlab("")
+```
+
+```{r counts per group in braintissues HPA, echo=F}
+##### Violin plots of enrichment in brain tissues ####
+brain.tissues <- "cerebral.cortex"
+
+tmp <- Global.list$Tissue_enrichment$HPA_expr_mat[,colnames(Global.list$Tissue_enrichment$HPA_expr_mat)%in%brain.tissues]
+
+tmp_brain <- list(Tolerant = lapply(Global.list$Groups$Tolerant, function(i) tmp[rownames(tmp)%in%i, ]),
+                  Intolerant = lapply(Global.list$Groups$Intolerant, function(i) tmp[rownames(tmp)%in%i, ]) )
+
+x <- melt(tmp_brain)
+
+p1 <- ggplot(x,aes(x=Var2,y=value,color=L1))+
+      geom_violin(scale="width")+
+      facet_grid(~L2)+
+      geom_boxplot(outlier.shape = NA, width=0.2, position = position_dodge(.9))+
+      scale_y_log10()+
+      ylab("ncounts")+xlab("")+theme_pubr()+
+      scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1]))+
+      theme(axis.text.y=element_text(size=8), axis.title.y = element_text(size=9),axis.text.x = element_text(size=8),legend.position = "")
+#### Differential expression
+tmp <- Global.list$Tissue_enrichment$HPA_enrich_mat[,colnames(Global.list$Tissue_enrichment$HPA_enrich_mat)%in%brain.tissues]
+
+tmp_brain <- list(Tolerant = lapply(Global.list$Groups$Tolerant, function(i) tmp[names(tmp)%in%i]),
+                  Intolerant = lapply(Global.list$Groups$Intolerant, function(i) tmp[names(tmp)%in%i]) )
+
+x <- melt(tmp_brain)
+x <- x[!(x$value<1 & x$value>-1),]
+x$value[x$value>0] <- log10(x$value[x$value>0])
+x$value[x$value<0] <- log10(abs(x$value[x$value<0]))*-1
+
+
+
+p2 <- ggviolin(x,y="value",color="L1", add="mean", add.params = list(group="L1"), trim=T)+
+  facet_grid(~L2)+
+  ylab("expression enrichment")+xlab("")+scale_y_continuous(breaks = c(-3,-2,-1,0,1,2,3))+
+  geom_hline(yintercept = 0,linetype="dashed")+
+  scale_color_manual(values = c("Tolerant"=ccols[2],"Intolerant"=ccols[1]))+
+  theme(axis.text.y=element_text(size=8), axis.title.y = element_text(size=9),axis.text.x = element_text(size=8),legend.position = "")
+
+  multiplot(p1,p2, cols = 1)
+```
+
